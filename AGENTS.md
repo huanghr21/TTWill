@@ -10,10 +10,13 @@ TTWill：面向买家的多品类电商客服 Agent，由 EchoMind 重构而来�
 
 ## 关键约束
 
-- `core/` 不依赖具体环境：业务数据只经 `gateway/` 访问，τ²-bench 相关代码只放在 `bench/`。
+- Python 包位于 `src/ttwill/`，目录职责以 `docs/02 Agent架构设计.md` 的“项目目录结构”为准，按实施步骤创建，不提前搭空架子。
+- `src/ttwill/core/` 不依赖具体环境：Agent 的业务数据访问只经 `src/ttwill/gateway/`；τ²-bench 专属实现只放在 `src/ttwill/bench/`，对应测试放在 `tests/bench/`。
+- `gateway/` 直接调用 `backend/`，`core/` 不导入 `backend/`；核心直接使用 LangGraph checkpointer，不为后端或持久化提前增加 Protocol。
+- 任务状态仅由 LangGraph 检查点持久化；动作结果来自网关记录，写任务完成由核验代码设置。恢复时对账后端操作记录，已提交不等于已核验。
 - 模型调用都走统一 LLM 调用层，关键步骤写入轨迹。τ² 内部的模拟用户与判分例外，不修改 τ² 代码（见 `docs/06 工程约定.md`）。
 - 写操作安全靠代码护栏，不靠提示词。
-- 测试用假模型，不调用真实服务。密钥只放 `.env`。
+- 测试用假模型，不调用真实服务；后端测试使用 fixture 创建的小型 SQLite 库。密钥只放 `.env`。
 - 不确定的细节和取舍一定要询问过后再写，不自己推断臆测。
 
 ## 代码风格
