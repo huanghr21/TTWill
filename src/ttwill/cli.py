@@ -11,6 +11,10 @@ from ttwill.tracing import Trace, render_tree
 
 
 async def run_demo(config_path: Path) -> Path:
+    """按指定配置运行一次假模型调用，打印轨迹树并返回会话 JSONL 路径。
+
+    配置须包含 flash 档位。每次调用新建运行目录，不读取密钥或访问模型服务。
+    """
     config = load_config(config_path)
     run_id = f"demo-{uuid4().hex}"
     session_id = uuid4().hex
@@ -41,6 +45,7 @@ async def run_demo(config_path: Path) -> Path:
 
 
 def main() -> None:
+    """解析命令行参数，执行假模型演示或离线轨迹查看。"""
     parser = argparse.ArgumentParser(prog="ttwill", description="TTWill 命令行入口")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo", help="用假模型验证调用、记录和轨迹树")

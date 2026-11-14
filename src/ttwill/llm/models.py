@@ -12,22 +12,47 @@ from ttwill.llm.types import LLMError
 
 
 class CompatibleModel:
+    """复用 HTTP 连接调用兼容服务；应通过 async with 使用并在退出时关闭连接。"""
+
     def __init__(
         self, env_path: Path, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
+        """读取指定 .env 的密钥快照并建立客户端，不发出请求。
+
+        不插值变量，也不读取或修改进程环境中的同名密钥。transport 可传入
+        测试用传输对象；密钥是否存在在 send 时检查。
+        """
         # 不把密钥载入全局环境，多个运行的配置不会互相污染。
         self._keys = dotenv_values(env_path, interpolate=False)
         self._client = httpx.AsyncClient(transport=transport)
 
     async def __aenter__(self) -> "CompatibleModel":
+        """返回当前客户端，供上下文内的多次请求复用连接。"""
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        """关闭 HTTP 客户端，不抑制上下文内的异常。"""
         await self._client.aclose()
 
     async def send(
         self, model: ModelConfig, request: dict[str, Any], timeout_seconds: float
     ) -> dict[str, Any]:
+        """向配置的 Chat Completions 地址发送一次请求，不在此层重试。
+
+        Args:
+            model: 服务地址及 .env 密钥名；模型名和生成参数已在 request 中。
+            request: 要发送的完整 JSON 请求体，不包含鉴权头。
+            timeout_seconds: HTTPX 各网络阶段的超时秒数；总时限由 LLMClient 控制。
+
+        Returns:
+            服务返回的完整 JSON 对象；消息和用量字段由调用层继续校验。
+
+        Raises:
+            LLMError: 配置或密钥缺失、传输失败、HTTP 非成功状态，或响应不是
+                JSON 对象。传输错误、408、429 和 5xx 标记为可重试；错误消息
+                不包含服务错误正文或鉴权头。
+            asyncio.CancelledError: 外部取消请求，原样向上传播。
+        """
         if not model.base_url or not model.api_key_env:
             raise LLMError("真实模型需要配置 base_url 与 api_key_env")
         key = self._keys.get(model.api_key_env)
@@ -61,12 +86,18 @@ class FakeModel:
     """按顺序返回响应或抛出错误；脚本耗尽明确失败，不访问网络。"""
 
     def __init__(self, responses: list[dict[str, Any] | LLMError]) -> None:
+        """保存按调用顺序消费的响应脚本，并初始化请求历史。"""
         self._responses = iter(responses)
         self.requests: list[dict[str, Any]] = []
 
     async def send(
         self, model: ModelConfig, request: dict[str, Any], timeout_seconds: float
     ) -> dict[str, Any]:
+        """记录请求副本，返回下一份响应副本或抛出脚本指定的 LLMError。
+
+        model 与 timeout_seconds 仅用于保持真实后端的调用签名，不参与脚本
+        选择或等待；脚本耗尽也抛出 LLMError，不生成默认响应。
+        """
         self.requests.append(deepcopy(request))
         response = next(self._responses, None)
         if response is None:

@@ -15,9 +15,12 @@ from ttwill.tracing import Trace
 
 
 class LLMClient:
+    """统一模型调用、响应校验与逐次尝试记录，由调用者管理后端连接的生命周期。"""
+
     def __init__(
         self, config: AppConfig, trace: Trace, backend: CompatibleModel | FakeModel
     ) -> None:
+        """绑定模型档位及重试配置、运行轨迹和后端；此时不发出模型请求。"""
         self.config = config
         self.trace = trace
         self.backend = backend
@@ -29,6 +32,28 @@ class LLMClient:
         *,
         tools: list[dict[str, Any]] | None = None,
     ) -> ModelResponse:
+        """按配置档位请求一个完整响应，并为每次尝试保存原文、轨迹和费用。
+
+        仅对可重试的 LLMError 和传输总超时进行指数退避，最多尝试
+        ``max_retries + 1`` 次。配置中的秒数限制每次后端传输的总用时，
+        不包含重试等待、响应解析和记录写入；取消会向上传播，不触发重试。
+        用量或计价信息缺失时，相应账本字段保留为 None。
+
+        Args:
+            tier: 配置中已定义的模型档位名称。
+            messages: Chat Completions 消息历史，调用时复制，不修改传入列表。
+            tools: 本次可用的工具定义；None 表示请求不携带 tools 字段。
+
+        Returns:
+            校验后的响应，保留服务返回的实际模型标识、完整消息和原始对象。
+
+        Raises:
+            ValueError: 档位未配置或消息列表为空。
+            LLMError: 请求或响应无效，或可重试的模型错误已耗尽重试次数。
+            TimeoutError: 最后一次传输尝试超过配置的总时限。
+            asyncio.CancelledError: 调用被取消，包括等待重试期间的取消。
+            OSError: 轨迹、模型原文或费用账本无法写入。
+        """
         if tier not in self.config.models:
             raise ValueError(f"未配置模型档位：{tier}")
         if not messages:

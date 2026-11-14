@@ -15,6 +15,12 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class LLMConfig:
+    """调用层的超时与重试设置。
+
+    timeout_seconds 是每次后端传输的总超时及 HTTP 各阶段超时，单位为秒；
+    max_retries 不含首次调用；retry_delay_seconds 是指数退避的初始等待秒数。
+    """
+
     timeout_seconds: float
     max_retries: int
     retry_delay_seconds: float
@@ -22,6 +28,12 @@ class LLMConfig:
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
+    """一个模型档位对应的实际接口、计价和请求参数。
+
+    api_key_env 仅保存本地 .env 中的变量名。价格单位为美元/百万 token，
+    None 表示价格未知；parameters 保存传给模型服务的非敏感参数。
+    """
+
     model: str
     base_url: str | None = None
     api_key_env: str | None = None
@@ -33,6 +45,11 @@ class ModelConfig:
 
 @dataclass(frozen=True, slots=True)
 class AppConfig:
+    """解析后的运行配置；路径为绝对路径，models 按档位名索引。
+
+    root 是配置文件所在目录，runs_dir 是运行产物目录；不包含密钥值。
+    """
+
     root: Path
     runs_dir: Path
     llm: LLMConfig
@@ -57,6 +74,7 @@ _SECRET_FIELDS = {
 
 
 def _table(value: Any, name: str) -> dict[str, Any]:
+    """要求字段为 TOML 表，错误信息用 name 标明配置位置。"""
     if not isinstance(value, dict):
         raise ConfigError(f"{name} 必须是配置表")
     return value
@@ -65,6 +83,7 @@ def _table(value: Any, name: str) -> dict[str, Any]:
 def _check_keys(
     value: dict[str, Any], name: str, required: set[str], optional: set[str] | None = None
 ) -> None:
+    """拒绝缺失的必填键和未知键，避免配置拼写错误被静默忽略。"""
     missing = required - value.keys()
     unknown = value.keys() - required - (optional or set())
     if missing:
@@ -74,12 +93,14 @@ def _check_keys(
 
 
 def _text(value: Any, name: str) -> str:
+    """校验非空文本并保留原值，不自动裁剪调用方的内容。"""
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{name} 必须是非空字符串")
     return value
 
 
 def _number(value: Any, name: str, *, positive: bool = False) -> float:
+    """将有限非负数转为浮点数；positive 为真时拒绝零，始终拒绝布尔值。"""
     if type(value) not in (int, float):
         raise ConfigError(f"{name} 必须是数值")
     try:
@@ -93,6 +114,7 @@ def _number(value: Any, name: str, *, positive: bool = False) -> float:
 
 
 def _parameter_value(value: Any, name: str) -> None:
+    """递归检查参数可序列化为 JSON，并拒绝认证字段和非有限数值。"""
     if isinstance(value, dict):
         for key, item in value.items():
             if key.lower().replace("-", "_") in _SECRET_FIELDS:
@@ -108,6 +130,7 @@ def _parameter_value(value: Any, name: str) -> None:
 
 
 def _model_config(value: Any, name: str) -> ModelConfig:
+    """校验单个模型配置，拒绝 URL 中的认证信息和调用层保留参数。"""
     data = _table(value, name)
     price_fields = {
         "input_cost_per_million",
@@ -152,7 +175,19 @@ def _model_config(value: Any, name: str) -> ModelConfig:
 
 
 def load_config(path: Path) -> AppConfig:
-    """相对路径以配置文件所在目录为准；不读取或修改环境变量。"""
+    """读取并校验 TOML 配置，不读取 .env 或修改环境变量。
+
+    Args:
+        path: 配置文件路径；其中 runs_dir 的相对路径以该文件所在目录为准。
+
+    Returns:
+        含绝对目录路径、调用限制和模型档位映射的运行配置。
+
+    Raises:
+        ConfigError: 字段缺失、未知或取值不符合约定。
+        tomllib.TOMLDecodeError: 文件不是合法 TOML。
+        OSError: 配置文件无法读取。
+    """
     path = path.resolve()
     with path.open("rb") as file:
         data = tomllib.load(file)

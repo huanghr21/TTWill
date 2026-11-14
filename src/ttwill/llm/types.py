@@ -8,11 +8,12 @@ from ttwill.config import ModelConfig
 
 
 class LLMError(RuntimeError):
-    """可公开的错误信息，不包含服务返回的原始错误正文或鉴权头。"""
+    """向调用者传递模型错误、重试标记及可选 HTTP 状态码。"""
 
     def __init__(
         self, message: str, *, retryable: bool = False, status_code: int | None = None
     ) -> None:
+        """保存已去除敏感信息的消息；默认不重试，不自动清洗 message。"""
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
@@ -20,12 +21,18 @@ class LLMError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Usage:
+    """一次响应的 token 用量；缓存命中数是输入总数的一部分。"""
+
     input_tokens: int
     output_tokens: int
     cached_input_tokens: int = 0
 
     def cost_usd(self, model: ModelConfig) -> float | None:
-        """缺少计价所需信息时保留未知，不能把未知费用当作零。"""
+        """按配置中每百万 token 的美元单价计算本次费用。
+
+        输入按缓存命中与未命中分别计价，输出单独计价。缺少所需单价时
+        返回 None；只有实际命中缓存时才要求配置缓存单价。
+        """
         rates = [model.input_cost_per_million, model.output_cost_per_million]
         if self.cached_input_tokens:
             rates.append(model.cached_input_cost_per_million)
@@ -41,6 +48,12 @@ class Usage:
 
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
+    """已解析的单个模型响应，保留完整消息和原始 JSON 对象。
+
+    model 是服务返回的实际模型标识；未提供用量时 usage 为 None。
+    message 和 raw 保留原对象引用，包括工具调用、推理内容等扩展字段。
+    """
+
     model: str
     message: dict[str, Any]
     finish_reason: str | None
@@ -49,6 +62,12 @@ class ModelResponse:
 
 
 def parse_usage(raw: dict[str, Any]) -> Usage | None:
+    """从原始响应解析 token 用量，usage 缺失或为 null 时返回 None。
+
+    缓存数优先取 prompt_cache_hit_tokens，其次取详情中的 cached_tokens，
+    两者均缺失时按零处理。字段结构错误、计数不是非负整数，或缓存数
+    超过输入总数时抛出 LLMError。
+    """
     data = raw.get("usage")
     if data is None:
         return None
@@ -71,6 +90,12 @@ def parse_usage(raw: dict[str, Any]) -> Usage | None:
 
 
 def parse_response(raw: dict[str, Any], usage: Usage | None) -> ModelResponse:
+    """校验单个 assistant 响应，附上已解析用量并保留完整原始内容。
+
+    响应须包含实际模型标识，以及文本、工具调用或拒答内容。工具调用
+    只检查结构，arguments 仍保留为字符串，不在此处解析或执行业务。
+    必需字段缺失或已检查字段的结构不符时抛出 LLMError。
+    """
     choices = raw.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise LLMError("模型必须返回一个 choice")
