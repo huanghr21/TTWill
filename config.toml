@@ -1,0 +1,13 @@
+runs_dir = "runs"
+
+[llm]
+timeout_seconds = 30.0
+max_retries = 2
+retry_delay_seconds = 0.5
+
+[models.flash]
+model = "fake-demo"
+# 仅用于假模型演示，不能作为真实服务的价格。
+input_cost_per_million = 0.0
+output_cost_per_million = 0.0
+cached_input_cost_per_million = 0.0

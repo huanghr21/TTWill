@@ -7,3 +7,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 runs/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
