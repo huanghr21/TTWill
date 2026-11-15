@@ -13,7 +13,13 @@ class LLMError(RuntimeError):
     def __init__(
         self, message: str, *, retryable: bool = False, status_code: int | None = None
     ) -> None:
-        """保存已去除敏感信息的消息；默认不重试，不自动清洗 message。"""
+        """保存模型错误及重试信息。
+
+        Args:
+            message: 调用方已去除敏感信息的错误消息，按原文保存。
+            retryable: 是否允许调用层重试本次错误。
+            status_code: 相关 HTTP 状态码；None 表示没有状态码。
+        """
         super().__init__(message)
         self.retryable = retryable
         self.status_code = status_code
@@ -21,7 +27,13 @@ class LLMError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Usage:
-    """一次响应的 token 用量；缓存命中数是输入总数的一部分。"""
+    """一次模型响应的 token 用量。
+
+    Attributes:
+        input_tokens: 输入 token 总数，包含缓存命中的部分。
+        output_tokens: 输出 token 总数。
+        cached_input_tokens: 输入中命中缓存的 token 数。
+    """
 
     input_tokens: int
     output_tokens: int
@@ -30,8 +42,14 @@ class Usage:
     def cost_usd(self, model: ModelConfig) -> float | None:
         """按配置中每百万 token 的美元单价计算本次费用。
 
-        输入按缓存命中与未命中分别计价，输出单独计价。缺少所需单价时
-        返回 None；只有实际命中缓存时才要求配置缓存单价。
+        输入按缓存命中与未命中分别计价，输出单独计价。
+
+        Args:
+            model: 含输入、输出及缓存输入单价的模型配置。
+
+        Returns:
+            本次响应的美元费用；缺少所需单价时返回 None。只有实际命中
+            缓存时才要求配置缓存单价。
         """
         rates = [model.input_cost_per_million, model.output_cost_per_million]
         if self.cached_input_tokens:
@@ -50,8 +68,12 @@ class Usage:
 class ModelResponse:
     """已解析的单个模型响应，保留完整消息和原始 JSON 对象。
 
-    model 是服务返回的实际模型标识；未提供用量时 usage 为 None。
-    message 和 raw 保留原对象引用，包括工具调用、推理内容等扩展字段。
+    Attributes:
+        model: 服务返回的实际模型标识。
+        message: assistant 消息的原对象引用，包括工具调用、推理内容等扩展字段。
+        finish_reason: 服务返回的结束原因；未提供时为 None。
+        usage: 已解析的 token 用量；未提供时为 None。
+        raw: 完整响应的原对象引用。
     """
 
     model: str
@@ -62,11 +84,19 @@ class ModelResponse:
 
 
 def parse_usage(raw: dict[str, Any]) -> Usage | None:
-    """从原始响应解析 token 用量，usage 缺失或为 null 时返回 None。
+    """从原始响应解析 token 用量。
 
     缓存数优先取 prompt_cache_hit_tokens，其次取详情中的 cached_tokens，
-    两者均缺失时按零处理。字段结构错误、计数不是非负整数，或缓存数
-    超过输入总数时抛出 LLMError。
+    两者均缺失时按零处理。
+
+    Args:
+        raw: 模型服务返回的完整响应对象。
+
+    Returns:
+        输入、输出及缓存输入的用量；usage 缺失或为 null 时返回 None。
+
+    Raises:
+        LLMError: 用量字段结构错误、计数不是非负整数，或缓存数超过输入总数。
     """
     data = raw.get("usage")
     if data is None:
@@ -94,7 +124,16 @@ def parse_response(raw: dict[str, Any], usage: Usage | None) -> ModelResponse:
 
     响应须包含实际模型标识，以及文本、工具调用或拒答内容。工具调用
     只检查结构，arguments 仍保留为字符串，不在此处解析或执行业务。
-    必需字段缺失或已检查字段的结构不符时抛出 LLMError。
+
+    Args:
+        raw: 模型服务返回的完整响应对象，要求仅包含一个 choice。
+        usage: 已解析的用量；None 表示服务未提供用量。
+
+    Returns:
+        包含实际模型标识、消息、结束原因和用量的响应，保留消息与原文的对象引用。
+
+    Raises:
+        LLMError: 必需字段缺失、已检查字段的结构不符，或消息没有有效内容。
     """
     choices = raw.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:

@@ -19,8 +19,12 @@ class CompatibleModel:
     ) -> None:
         """读取指定 .env 的密钥快照并建立客户端，不发出请求。
 
-        不插值变量，也不读取或修改进程环境中的同名密钥。transport 可传入
-        测试用传输对象；密钥是否存在在 send 时检查。
+        不插值变量，也不读取或修改进程环境中的同名密钥。密钥是否存在在
+        send 时检查。
+
+        Args:
+            env_path: 保存模型密钥的本地 .env 文件路径。
+            transport: HTTP 传输对象，可用于测试；None 表示使用 HTTPX 默认传输。
         """
         # 不把密钥载入全局环境，多个运行的配置不会互相污染。
         self._keys = dotenv_values(env_path, interpolate=False)
@@ -86,17 +90,29 @@ class FakeModel:
     """按顺序返回响应或抛出错误；脚本耗尽明确失败，不访问网络。"""
 
     def __init__(self, responses: list[dict[str, Any] | LLMError]) -> None:
-        """保存按调用顺序消费的响应脚本，并初始化请求历史。"""
+        """保存响应脚本并初始化请求历史。
+
+        Args:
+            responses: 按调用顺序消费的响应对象或 LLMError；每次调用消费一项。
+        """
         self._responses = iter(responses)
         self.requests: list[dict[str, Any]] = []
 
     async def send(
         self, model: ModelConfig, request: dict[str, Any], timeout_seconds: float
     ) -> dict[str, Any]:
-        """记录请求副本，返回下一份响应副本或抛出脚本指定的 LLMError。
+        """记录请求副本并消费下一项响应脚本。
 
-        model 与 timeout_seconds 仅用于保持真实后端的调用签名，不参与脚本
-        选择或等待；脚本耗尽也抛出 LLMError，不生成默认响应。
+        Args:
+            model: 与真实后端保持一致的模型配置参数，不参与响应选择。
+            request: 本次请求体；副本会追加到 requests 历史中。
+            timeout_seconds: 与真实后端保持一致的超时参数，假模型不执行等待。
+
+        Returns:
+            当前脚本项的响应副本。
+
+        Raises:
+            LLMError: 当前脚本项是错误，或响应脚本已耗尽。
         """
         self.requests.append(deepcopy(request))
         response = next(self._responses, None)

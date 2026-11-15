@@ -1,3 +1,5 @@
+"""验证模型调用的兼容请求、重试、取消、记录和费用统计。"""
+
 import asyncio
 import json
 from pathlib import Path
@@ -18,6 +20,17 @@ def make_config(
     timeout_seconds: float = 1,
     model: ModelConfig | None = None,
 ) -> AppConfig:
+    """构造模型调用测试所需的应用配置。
+
+    Args:
+        tmp_path: 配置根目录，运行记录保存到其 runs 子目录。
+        max_retries: 首次尝试失败后允许的重试次数。
+        timeout_seconds: 每次调用尝试的总超时秒数。
+        model: flash 档模型配置；为 None 时使用固定的兼容接口测试配置。
+
+    Returns:
+        将重试等待设为零、仅配置 flash 档模型的应用配置。
+    """
     return AppConfig(
         root=tmp_path,
         runs_dir=tmp_path / "runs",
@@ -38,6 +51,14 @@ def make_config(
 
 
 def model_response(*, usage: bool = True) -> dict[str, Any]:
+    """构造兼容接口的固定模型响应。
+
+    Args:
+        usage: 是否附带输入、输出和缓存 token 用量。
+
+    Returns:
+        包含模型名、单条助手回复以及可选用量字段的原始响应字典。
+    """
     raw = {
         "id": "completion-1",
         "model": "actual-model",
@@ -58,14 +79,38 @@ def model_response(*, usage: bool = True) -> dict[str, Any]:
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """按行读取 JSONL 测试记录。
+
+    Args:
+        path: 要读取的 JSONL 文件路径。
+
+    Returns:
+        按文件顺序解析得到的记录列表。
+    """
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def read_usage(trace: Trace) -> list[dict[str, Any]]:
+    """读取当前运行的全部用量记录。
+
+    Args:
+        trace: 提供运行目录的轨迹对象。
+
+    Returns:
+        usage.jsonl 中按写入顺序保存的用量记录。
+    """
     return read_jsonl(trace.run_dir / "usage.jsonl")
 
 
 def read_model_records(trace: Trace) -> list[dict[str, Any]]:
+    """按用量账本的引用读取完整模型记录。
+
+    Args:
+        trace: 提供运行目录及用量账本位置的轨迹对象。
+
+    Returns:
+        与账本记录顺序一致的原始模型调用记录列表。
+    """
     return [
         json.loads((trace.run_dir / row["record_ref"]).read_text(encoding="utf-8"))
         for row in read_usage(trace)
@@ -73,12 +118,21 @@ def read_model_records(trace: Trace) -> list[dict[str, Any]]:
 
 
 def write_env(tmp_path: Path) -> Path:
+    """为兼容接口测试写入固定的测试密钥。
+
+    Args:
+        tmp_path: 接收 .env 文件的临时目录。
+
+    Returns:
+        已写入 TTWILL_TEST_KEY 测试值的 .env 文件路径。
+    """
     path = tmp_path / ".env"
     path.write_text("TTWILL_TEST_KEY=file-secret\n", encoding="utf-8")
     return path
 
 
 def test_refusal_is_a_valid_response_and_is_preserved(tmp_path):
+    """拒答作为有效响应保存原始内容，并记录成功状态。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "refusal")
     raw = model_response()
@@ -98,6 +152,7 @@ def test_refusal_is_a_valid_response_and_is_preserved(tmp_path):
 
 
 def test_compatible_request_and_full_response_are_preserved(tmp_path, monkeypatch):
+    """兼容接口完整保留请求、响应及用量，公开轨迹与落盘文件均不含密钥。"""
     monkeypatch.setenv("TTWILL_TEST_KEY", "environment-secret")
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "request", run_id="run", task_id="task", repeat=2)
@@ -134,10 +189,12 @@ def test_compatible_request_and_full_response_are_preserved(tmp_path, monkeypatc
     requests = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         requests.append(request)
         return httpx.Response(200, json=raw)
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         async with CompatibleModel(
             write_env(tmp_path), transport=httpx.MockTransport(handler)
         ) as backend:
@@ -188,12 +245,14 @@ def test_compatible_request_and_full_response_are_preserved(tmp_path, monkeypatc
 
 
 def test_retryable_http_errors_keep_each_attempt_and_span_parent(tmp_path):
+    """可重试 HTTP 错误逐次记账，并在成功前后保持同一父轨迹。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "retries")
     statuses = iter([429, 503, 200])
     requests = []
 
     def handler(request):
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         requests.append(json.loads(request.content))
         status = next(statuses)
         return httpx.Response(
@@ -202,6 +261,7 @@ def test_retryable_http_errors_keep_each_attempt_and_span_parent(tmp_path):
         )
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         async with CompatibleModel(
             write_env(tmp_path), transport=httpx.MockTransport(handler)
         ) as backend:
@@ -233,16 +293,26 @@ def test_retryable_http_errors_keep_each_attempt_and_span_parent(tmp_path):
 
 
 def test_unauthorized_does_not_retry_and_next_span_keeps_parent(tmp_path):
+    """认证失败立即结束，后续 span 仍使用正确的父层级。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "unauthorized")
     calls = 0
 
     def handler(request):
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         nonlocal calls
         calls += 1
         return httpx.Response(401, text="file-secret is invalid")
 
     async def run():
+        """在认证失败后继续创建轨迹，观察父层级是否恢复。
+
+        Returns:
+            按顺序包含以下对象的三元组：
+                parent: 认证失败所在轮次的父 span。
+                next_span: 同轮失败处理完成后创建的护栏 span。
+                next_session: 本轮结束后创建的新会话 span。
+        """
         async with CompatibleModel(
             write_env(tmp_path), transport=httpx.MockTransport(handler)
         ) as backend:
@@ -266,11 +336,13 @@ def test_unauthorized_does_not_retry_and_next_span_keeps_parent(tmp_path):
 
 
 def test_transport_error_is_retried_without_recording_exception_text(tmp_path):
+    """连接异常触发重试，记录只保留异常类型而不保存敏感异常文本。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "transport")
     calls = 0
 
     def handler(request):
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -278,6 +350,7 @@ def test_transport_error_is_retried_without_recording_exception_text(tmp_path):
         return httpx.Response(200, json=model_response())
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         async with CompatibleModel(
             write_env(tmp_path), transport=httpx.MockTransport(handler)
         ) as backend:
@@ -292,16 +365,19 @@ def test_transport_error_is_retried_without_recording_exception_text(tmp_path):
 
 
 def test_total_attempt_timeout_is_bounded_and_each_retry_is_recorded(tmp_path):
+    """每次尝试均受总超时限制，超时重试逐次留下记录。"""
     config = make_config(tmp_path, timeout_seconds=0.01, max_retries=1)
     trace = Trace(config.runs_dir, "timeout")
     calls = 0
 
     async def handler(request):
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         nonlocal calls
         calls += 1
         await asyncio.Event().wait()
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         async with CompatibleModel(
             write_env(tmp_path), transport=httpx.MockTransport(handler)
         ) as backend:
@@ -320,14 +396,23 @@ def test_total_attempt_timeout_is_bounded_and_each_retry_is_recorded(tmp_path):
 
 
 def test_cancellation_stops_retries_and_records_cancelled_attempt(tmp_path):
+    """取消请求停止重试并记录取消状态，后续轨迹恢复正确层级。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "cancelled")
     calls = 0
 
     async def run():
+        """取消等待中的模型请求，再创建同轮护栏轨迹。
+
+        Returns:
+            按顺序包含以下对象的二元组：
+                parent: 被取消请求所属轮次的父 span。
+                next_span: 取消处理完成后创建的护栏 span。
+        """
         entered = asyncio.Event()
 
         async def handler(request):
+            """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
             nonlocal calls
             calls += 1
             entered.set()
@@ -375,6 +460,7 @@ def test_cancellation_stops_retries_and_records_cancelled_attempt(tmp_path):
     ],
 )
 def test_missing_usage_or_prices_stay_unknown(tmp_path, has_usage, prices, expected_cost):
+    """用量或价格缺失时费用保持未知，零价格仍计为零费用。"""
     model = ModelConfig(
         model="fake",
         input_cost_per_million=prices[0],
@@ -399,6 +485,7 @@ def test_missing_usage_or_prices_stay_unknown(tmp_path, has_usage, prices, expec
 
 
 def test_malformed_response_keeps_original_and_bills_known_usage(tmp_path):
+    """响应格式错误仍保存原文和已知费用，后续调用使用新的调用标识。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "invalid")
     raw = model_response()
@@ -422,11 +509,13 @@ def test_malformed_response_keeps_original_and_bills_known_usage(tmp_path):
 
 
 def test_success_inside_handled_exception_is_not_billed_as_error(tmp_path):
+    """在已处理异常的分支中成功调用模型仍记为成功。"""
     config = make_config(tmp_path)
     trace = Trace(config.runs_dir, "handled")
     client = LLMClient(config, trace, FakeModel([model_response()]))
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         try:
             raise ValueError("已处理的异常")
         except ValueError:
@@ -439,6 +528,7 @@ def test_success_inside_handled_exception_is_not_billed_as_error(tmp_path):
 
 
 def test_env_is_not_replaced_by_process_environment(tmp_path, monkeypatch):
+    """.env 缺少密钥时在发请求前报错，不采用进程环境中的同名密钥。"""
     monkeypatch.setenv("TTWILL_TEST_KEY", "environment-secret")
     env = tmp_path / ".env"
     env.write_text("", encoding="utf-8")
@@ -447,10 +537,12 @@ def test_env_is_not_replaced_by_process_environment(tmp_path, monkeypatch):
     calls = []
 
     def handler(request):
+        """提供当前测试指定的模拟 HTTP 响应或异常，并记录调用情况。"""
         calls.append(request)
         return httpx.Response(200, json=model_response())
 
     async def run():
+        """执行当前场景的异步模型调用，供测试检查结果和调用记录。"""
         async with CompatibleModel(env, transport=httpx.MockTransport(handler)) as backend:
             with pytest.raises(LLMError, match=".env"):
                 await LLMClient(config, trace, backend).complete(

@@ -17,8 +17,10 @@ class ConfigError(ValueError):
 class LLMConfig:
     """调用层的超时与重试设置。
 
-    timeout_seconds 是每次后端传输的总超时及 HTTP 各阶段超时，单位为秒；
-    max_retries 不含首次调用；retry_delay_seconds 是指数退避的初始等待秒数。
+    Attributes:
+        timeout_seconds: 每次后端传输的总超时及 HTTP 各阶段超时，单位为秒。
+        max_retries: 首次调用失败后的最多重试次数，不含首次调用。
+        retry_delay_seconds: 指数退避的初始等待秒数。
     """
 
     timeout_seconds: float
@@ -30,8 +32,14 @@ class LLMConfig:
 class ModelConfig:
     """一个模型档位对应的实际接口、计价和请求参数。
 
-    api_key_env 仅保存本地 .env 中的变量名。价格单位为美元/百万 token，
-    None 表示价格未知；parameters 保存传给模型服务的非敏感参数。
+    Attributes:
+        model: 发送给服务的模型名称。
+        base_url: 兼容 Chat Completions 的服务基础地址；假模型可设为 None。
+        api_key_env: 本地 .env 中的密钥变量名；假模型可设为 None。
+        input_cost_per_million: 非缓存输入的美元单价，按百万 token 计；None 表示未知。
+        output_cost_per_million: 输出的美元单价，按百万 token 计；None 表示未知。
+        cached_input_cost_per_million: 缓存输入的美元单价，按百万 token 计；None 表示未知。
+        parameters: 传给模型服务的非敏感生成参数。
     """
 
     model: str
@@ -44,16 +52,46 @@ class ModelConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class AppConfig:
-    """解析后的运行配置；路径为绝对路径，models 按档位名索引。
+class BackendConfig:
+    """业务操作的准备有效期设置。
 
-    root 是配置文件所在目录，runs_dir 是运行产物目录；不包含密钥值。
+    Attributes:
+        operation_ttl_seconds: 操作准备完成后允许提交的时长，单位为秒。
+    """
+
+    operation_ttl_seconds: float = 900
+
+
+@dataclass(frozen=True, slots=True)
+class AgentConfig:
+    """子 Agent 单次派工的工具循环限制。
+
+    Attributes:
+        max_steps: 单次派工的最多步数；每个工具调用计一步，无工具回复也计一步。
+    """
+
+    max_steps: int = 12
+
+
+@dataclass(frozen=True, slots=True)
+class AppConfig:
+    """解析后的运行配置，不包含密钥值。
+
+    Attributes:
+        root: 配置文件所在目录的绝对路径。
+        runs_dir: 运行产物目录的绝对路径。
+        llm: 模型调用的超时与重试设置。
+        models: 按模型档位名称索引的模型配置。
+        backend: 业务操作的准备有效期设置。
+        agent: 子 Agent 单次派工的步数上限。
     """
 
     root: Path
     runs_dir: Path
     llm: LLMConfig
     models: dict[str, ModelConfig]
+    backend: BackendConfig = field(default_factory=BackendConfig)
+    agent: AgentConfig = field(default_factory=AgentConfig)
 
 
 _RESERVED_PARAMETERS = {"model", "messages", "tools", "stream", "timeout"}
@@ -83,7 +121,17 @@ def _table(value: Any, name: str) -> dict[str, Any]:
 def _check_keys(
     value: dict[str, Any], name: str, required: set[str], optional: set[str] | None = None
 ) -> None:
-    """拒绝缺失的必填键和未知键，避免配置拼写错误被静默忽略。"""
+    """检查配置表的必填键和允许使用的键。
+
+    Args:
+        value: 待检查的配置表。
+        name: 错误信息中使用的配置位置。
+        required: 必须存在的键。
+        optional: 额外允许的键；None 表示没有可选键。
+
+    Raises:
+        ConfigError: 缺失必填键或包含未知键。
+    """
     missing = required - value.keys()
     unknown = value.keys() - required - (optional or set())
     if missing:
@@ -100,7 +148,19 @@ def _text(value: Any, name: str) -> str:
 
 
 def _number(value: Any, name: str, *, positive: bool = False) -> float:
-    """将有限非负数转为浮点数；positive 为真时拒绝零，始终拒绝布尔值。"""
+    """校验配置数值并转换为浮点数。
+
+    Args:
+        value: 待校验的数值，支持整数和浮点数。
+        name: 错误信息中使用的配置位置。
+        positive: 是否要求大于零；False 时允许零。
+
+    Returns:
+        满足取值范围的有限浮点数。
+
+    Raises:
+        ConfigError: 输入是布尔值、非数值、超出浮点数范围或不满足取值范围。
+    """
     if type(value) not in (int, float):
         raise ConfigError(f"{name} 必须是数值")
     try:
@@ -114,7 +174,15 @@ def _number(value: Any, name: str, *, positive: bool = False) -> float:
 
 
 def _parameter_value(value: Any, name: str) -> None:
-    """递归检查参数可序列化为 JSON，并拒绝认证字段和非有限数值。"""
+    """递归检查模型参数的取值与认证信息。
+
+    Args:
+        value: 待检查的参数值，配置表和列表会逐项递归检查。
+        name: 错误信息中使用的配置位置。
+
+    Raises:
+        ConfigError: 包含认证字段、非有限数值或不支持的参数类型。
+    """
     if isinstance(value, dict):
         for key, item in value.items():
             if key.lower().replace("-", "_") in _SECRET_FIELDS:
@@ -130,7 +198,18 @@ def _parameter_value(value: Any, name: str) -> None:
 
 
 def _model_config(value: Any, name: str) -> ModelConfig:
-    """校验单个模型配置，拒绝 URL 中的认证信息和调用层保留参数。"""
+    """校验单个模型档位的接口、计价与生成参数。
+
+    Args:
+        value: 从 TOML 读取的模型档位配置表。
+        name: 错误信息中使用的档位配置位置。
+
+    Returns:
+        解析后的模型配置；未配置的接口、密钥名和单价保留为 None。
+
+    Raises:
+        ConfigError: 字段缺失、未知或取值不符合约定，包括认证信息和保留参数。
+    """
     data = _table(value, name)
     price_fields = {
         "input_cost_per_million",
@@ -191,7 +270,7 @@ def load_config(path: Path) -> AppConfig:
     path = path.resolve()
     with path.open("rb") as file:
         data = tomllib.load(file)
-    _check_keys(data, "配置", {"runs_dir", "llm", "models"})
+    _check_keys(data, "配置", {"runs_dir", "llm", "models"}, {"backend", "agent"})
     root = path.parent
     runs_dir = (root / _text(data["runs_dir"], "runs_dir")).resolve()
     llm = _table(data["llm"], "llm")
@@ -211,4 +290,25 @@ def load_config(path: Path) -> AppConfig:
         _text(tier, "模型档位"): _model_config(value, f"models.{tier}")
         for tier, value in models.items()
     }
-    return AppConfig(root=root, runs_dir=runs_dir, llm=llm_config, models=parsed_models)
+    backend = _table(data.get("backend", {}), "backend")
+    _check_keys(backend, "backend", set(), {"operation_ttl_seconds"})
+    backend_config = BackendConfig(
+        operation_ttl_seconds=_number(
+            backend.get("operation_ttl_seconds", 900),
+            "backend.operation_ttl_seconds",
+            positive=True,
+        )
+    )
+    agent = _table(data.get("agent", {}), "agent")
+    _check_keys(agent, "agent", set(), {"max_steps"})
+    max_steps = agent.get("max_steps", 12)
+    if type(max_steps) is not int or max_steps < 1:
+        raise ConfigError("agent.max_steps 必须是正整数")
+    return AppConfig(
+        root=root,
+        runs_dir=runs_dir,
+        llm=llm_config,
+        models=parsed_models,
+        backend=backend_config,
+        agent=AgentConfig(max_steps=max_steps),
+    )

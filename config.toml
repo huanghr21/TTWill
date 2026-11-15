@@ -1,5 +1,12 @@
 runs_dir = "runs"
 
+[agent]
+# 开发默认值；每个工具调用计一步，无工具回复也计一步。
+max_steps = 12
+
+[backend]
+operation_ttl_seconds = 900
+
 [llm]
 timeout_seconds = 30.0
 max_retries = 2

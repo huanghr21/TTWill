@@ -1,0 +1,404 @@
+"""以会话身份和能力白名单约束业务工具，并记录实际调用结果。"""
+
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from ttwill.backend import BusinessError, RetailBackend, request_key
+from ttwill.backend.arguments import ARGUMENT_MODELS, validate_arguments
+from ttwill.gateway.skills import SkillCatalog
+from ttwill.tracing import Trace
+
+IDENTITY_TOOLS = frozenset({"find_user_id_by_email", "find_user_id_by_name_zip"})
+ORDER_WRITES = frozenset(
+    {
+        "cancel_pending_order",
+        "modify_pending_order_address",
+        "modify_pending_order_items",
+        "modify_pending_order_payment",
+        "modify_user_address",
+    }
+)
+AFTER_SALES_WRITES = frozenset({"exchange_delivered_order_items", "return_delivered_order_items"})
+WRITE_TOOLS = ORDER_WRITES | AFTER_SALES_WRITES
+READ_TOOLS = frozenset(ARGUMENT_MODELS) - WRITE_TOOLS - IDENTITY_TOOLS
+CAPABILITY_TOOLS = {
+    "coordinator": IDENTITY_TOOLS | {"get_user_details"},
+    "order_service": READ_TOOLS | ORDER_WRITES | {"load_skill"},
+    "after_sales": READ_TOOLS | AFTER_SALES_WRITES | {"load_skill"},
+}
+
+
+class LoadSkillArguments(BaseModel):
+    """加载当前能力的一项 Skill，读取政策及动作办理要点。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str = Field(min_length=1, description="本能力 Skill 目录中的名称")
+
+
+TOOL_MODELS = {**ARGUMENT_MODELS, "load_skill": LoadSkillArguments}
+
+
+@dataclass
+class SessionContext:
+    """由代码保存当前聊天的身份验证结果。
+
+    Attributes:
+        session_id: 当前聊天会话的唯一标识。
+        user_id: 已验证的用户 ID；None 表示尚未验证身份。
+    """
+
+    session_id: str
+    user_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """派出工具调用时附带会话、能力、实例和任务信息。
+
+    Attributes:
+        session: 当前聊天的身份上下文。
+        capability: 当前调用方的能力名称，决定可调用的工具集合。
+        instance_id: 发起调用的实例标识，用于区分工具记录。
+        task_id: 关联任务的稳定标识；写操作必须提供，其他调用可为 None。
+        revision: 任务修订号，初始为 1，请求内容变化时递增。
+    """
+
+    session: SessionContext
+    capability: str
+    instance_id: str
+    task_id: str | None = None
+    revision: int = 1
+
+
+class ToolGateway:
+    """提供模型业务工具，以及代码专用的提交和拒绝入口。
+
+    Attributes:
+        backend: 执行业务查询与准备、提交、拒绝操作的后端。
+        trace: 当前会话的轨迹记录器。
+        skills: 按能力组织政策和动作说明的 Skill 目录。
+        records: 按调用顺序保存的事实记录，包含上下文、参数及执行结果或错误原因。
+    """
+
+    def __init__(self, backend: RetailBackend, trace: Trace, skills: SkillCatalog) -> None:
+        """连接业务后端、会话轨迹与 Skill 目录，并检查写工具的政策覆盖。
+
+        Args:
+            backend: 本次运行使用的业务后端实例。
+            trace: 用于记录工具调用和护栏检查的会话轨迹。
+            skills: 含全部写工具对应政策的 Skill 目录。
+
+        Raises:
+            ValueError: 写工具缺少 Skill，或 Skill 声明的工具超出其能力权限。
+        """
+        self.backend = backend
+        self.trace = trace
+        self.skills = skills
+        self.records: list[dict[str, Any]] = []
+        self._loaded: dict[tuple[str, str | None, str, str], set[str]] = {}
+        self._validate_skills()
+
+    def _validate_skills(self) -> None:
+        """启动时核对能力与写工具的 Skill 声明，读取元数据不解锁实例。"""
+        covered = set()
+        for capability, allowed in CAPABILITY_TOOLS.items():
+            for name in self.skills.names(capability):
+                skill = self.skills.load(capability, name)
+                tools = set(skill["tools"])
+                if not tools or not tools <= allowed & WRITE_TOOLS:
+                    raise ValueError(f"Skill {name} 的关联写工具不符合能力 {capability}")
+                for tool in tools:
+                    if self.skills.required_skill(tool) != name:
+                        raise ValueError(f"写工具 {tool} 的 Skill 声明不一致")
+                covered.update(tools)
+        if missing := WRITE_TOOLS - covered:
+            raise ValueError(f"写工具缺少 Skill：{', '.join(sorted(missing))}")
+
+    @staticmethod
+    def _instance_key(context: CallContext) -> tuple[str, str | None, str, str]:
+        """用代码提供的会话、用户、能力和实例标识定位加载记录。"""
+        return (
+            context.session.session_id,
+            context.session.user_id,
+            context.capability,
+            context.instance_id,
+        )
+
+    def loaded_skills(self, context: CallContext) -> frozenset[str]:
+        """读取当前实例已经成功加载的 Skill 名称。
+
+        Args:
+            context: 指定会话身份、能力和实例的代码上下文。
+
+        Returns:
+            已加载名称的不可变集合；尚未加载或实例已释放时为空集合。
+        """
+        return frozenset(self._loaded.get(self._instance_key(context), ()))
+
+    def release_instance(self, context: CallContext) -> None:
+        """清除已结束实例的 Skill 加载记录。
+
+        Args:
+            context: 即将销毁的实例使用的会话身份和能力上下文。
+        """
+        self._loaded.pop(self._instance_key(context), None)
+
+    def schemas(self, context: CallContext) -> list[dict[str, Any]]:
+        """构造当前身份和能力可用的 Chat Completions 工具定义。
+
+        Args:
+            context: 当前调用的会话身份和能力上下文。
+
+        Returns:
+            可直接传入统一模型调用层的工具定义列表，每项包含工具名称、说明
+            和参数 JSON Schema；没有可用工具时返回空列表。
+        """
+        allowed = CAPABILITY_TOOLS.get(context.capability, frozenset())
+        if context.session.user_id is None:
+            allowed = allowed & IDENTITY_TOOLS
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": model.__doc__.strip(),
+                    "parameters": model.model_json_schema(),
+                },
+            }
+            for name, model in TOOL_MODELS.items()
+            if name in allowed
+        ]
+
+    def _guard(self, allowed: bool, name: str, reason: str) -> None:
+        """记录一次访问判定，并拦截未通过的调用。
+
+        Args:
+            allowed: 本次检查是否允许调用继续执行。
+            name: 护栏名称，同时作为拦截时的业务错误码。
+            reason: 拦截时写入轨迹和异常的原因。
+
+        Raises:
+            BusinessError: allowed 为 False。
+        """
+        with self.trace.span("guard", name) as span:
+            span.attrs["allowed"] = allowed
+            if not allowed:
+                span.status = "blocked"
+                span.attrs["reason"] = reason
+        if not allowed:
+            raise BusinessError(reason, code=name)
+
+    def _identity(self, context: CallContext) -> str:
+        """检查当前会话已验证身份，并返回其用户 ID。"""
+        self._guard(context.session.user_id is not None, "identity_required", "请先验证用户身份")
+        return context.session.user_id
+
+    def _attrs(self, context: CallContext, name: str, args: dict, kind: str) -> dict:
+        """构造调用记录和工具轨迹共用的上下文信息。
+
+        Args:
+            context: 本次调用的会话、能力、实例和任务上下文。
+            name: 工具名称或代码操作名称。
+            args: 调用参数；写入记录时复制，避免后续修改影响轨迹。
+            kind: 调用类别，为 call、commit、reject 或 operation（操作对账）。
+
+        Returns:
+            包含调用类别、上下文标识、动作名称、参数副本和读写类别的属性字典。
+        """
+        return {
+            "kind": kind,
+            "session_id": context.session.session_id,
+            "user_id": context.session.user_id,
+            "capability": context.capability,
+            "instance_id": context.instance_id,
+            "task_id": context.task_id,
+            "revision": context.revision,
+            "action": name,
+            "args": deepcopy(args),
+            "read_write": "write"
+            if name in WRITE_TOOLS or kind in {"commit", "reject"}
+            else "read",
+        }
+
+    def call(self, context: CallContext, name: str, args: dict) -> Any:
+        """执行一次模型工具调用，并记录参数与实际结果。
+
+        身份查找成功后绑定本会话用户。写工具只准备操作，同一任务修订与动作
+        跨实例沿用请求标识。
+
+        Args:
+            context: 代码构造的调用上下文；写操作须包含任务 ID 和有效修订号。
+            name: 当前能力允许使用的业务工具名称，或 load_skill。
+            args: 工具的参数字典，字段与类型须符合对应参数模型。
+
+        Returns:
+            身份工具返回用户 ID；读工具返回实体或目录字典；写工具返回包含
+            operation_id、status、preview 等字段的操作记录，重复请求沿用已有记录；
+            load_skill 返回包含名称、关联工具、政策章节和正文的 Skill 内容。
+
+        Raises:
+            BusinessError: 工具名称、能力、身份或参数检查失败，缺少有效任务关联，
+                关联 Skill 尚未加载、Skill 加载失败，或后端业务规则不满足。
+        """
+        attrs = self._attrs(context, name, args, "call")
+        with self.trace.span("tool", name, attrs=attrs) as span:
+            try:
+                self._guard(name in TOOL_MODELS, "unknown_tool", "未知业务工具")
+                self._guard(
+                    name in CAPABILITY_TOOLS.get(context.capability, ()),
+                    "capability_denied",
+                    "当前能力不能调用该工具",
+                )
+                if name not in IDENTITY_TOOLS:
+                    self._identity(context)
+                try:
+                    arguments = (
+                        LoadSkillArguments.model_validate(args).model_dump()
+                        if name == "load_skill"
+                        else validate_arguments(name, args)
+                    )
+                except ValueError as exc:
+                    self._guard(False, "invalid_arguments", str(exc))
+                if name == "load_skill":
+                    skill_name = arguments["name"]
+                    self._guard(
+                        skill_name in self.skills.names(context.capability),
+                        "skill_denied",
+                        "当前能力不能加载该 Skill",
+                    )
+                    try:
+                        result = self.skills.load(context.capability, skill_name)
+                    except ValueError as exc:
+                        self._guard(False, "skill_unavailable", str(exc))
+                    self._loaded.setdefault(self._instance_key(context), set()).add(skill_name)
+                elif name in IDENTITY_TOOLS:
+                    result = getattr(self.backend, name)(**arguments)
+                    self._guard(
+                        context.session.user_id in (None, result),
+                        "identity_locked",
+                        "当前会话不能切换用户",
+                    )
+                    context.session.user_id = result
+                    span.attrs["user_id"] = result
+                elif name in WRITE_TOOLS:
+                    required = self.skills.required_skill(name)
+                    self._guard(
+                        required in self.loaded_skills(context),
+                        "skill_required",
+                        f"当前实例须先加载 Skill：{required}",
+                    )
+                    self._guard(bool(context.task_id), "task_required", "准备写操作需要任务 ID")
+                    key = request_key(context.task_id, context.revision, name)
+                    span.attrs["request_key"] = key
+                    result = self.backend.prepare(context.session.user_id, name, arguments, key)
+                else:
+                    result = self.backend.query(context.session.user_id, name, arguments)
+            except BusinessError as exc:
+                span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                self.records.append(deepcopy(span.attrs))
+                raise
+            span.attrs["result"] = deepcopy(result)
+            span.attrs["status"] = result["status"] if name in WRITE_TOOLS else "executed"
+            if name in WRITE_TOOLS:
+                span.attrs["operation_id"] = result["operation_id"]
+            self.records.append(deepcopy(span.attrs))
+            return result
+
+    def commit(self, context: CallContext, operation_id: str, expected_args: dict) -> dict:
+        """由确认代码提交操作，核对身份及展示参数并记录执行结果。
+
+        此方法不注册为模型工具；确认护栏负责检查真实用户授权和展示有效期。
+
+        Args:
+            context: 包含已验证会话身份的调用上下文。
+            operation_id: 待提交的后端操作 ID。
+            expected_args: 已展示给用户的准备参数，须与后端保存的 args 完全一致。
+
+        Returns:
+            状态为 committed 的操作记录，result 为提交后的业务实体；重复提交
+            沿用原记录和结果。
+
+        Raises:
+            BusinessError: 身份未验证、操作不存在或归属不符、展示参数不一致、
+                操作已失效，或提交时的业务复核失败。
+        """
+        return self._resolve(context, "commit", operation_id, expected_args)
+
+    def reject(self, context: CallContext, operation_id: str, reason: str) -> dict:
+        """由代码拒绝或作废操作，记录结果并释放后端占用。
+
+        Args:
+            context: 包含已验证会话身份的调用上下文。
+            operation_id: 待拒绝或作废的后端操作 ID。
+            reason: 拒绝或作废原因，须包含非空白字符。
+
+        Returns:
+            后端的当前操作记录；待提交操作变为 rejected，已失效操作保持原状态。
+
+        Raises:
+            ValueError: reason 为空或仅含空白。
+            BusinessError: 身份未验证、操作不存在、不属于当前用户，或已经提交。
+        """
+        return self._resolve(context, "reject", operation_id, {"reason": reason})
+
+    def get_operation(self, context: CallContext, operation_id: str) -> dict:
+        """由运行代码读取操作当前状态，记录到期等后端变更以供对账。
+
+        此方法不注册为模型工具。后端会将超过有效期的待提交操作更新为 expired。
+
+        Args:
+            context: 包含已验证会话身份的调用上下文。
+            operation_id: 需要核对当前状态的后端操作 ID。
+
+        Returns:
+            当前完整操作记录，包含状态、原参数、预览、提交结果及过期时间。
+
+        Raises:
+            BusinessError: 身份尚未验证、操作不存在，或操作不属于当前用户。
+        """
+        return self._resolve(context, "operation", operation_id, {})
+
+    def _resolve(self, context: CallContext, kind: str, operation_id: str, args: dict) -> dict:
+        """记录代码提交、拒绝或对账操作的身份检查、参数与执行结果。
+
+        Args:
+            context: 本次代码操作的调用上下文。
+            kind: commit 表示提交，reject 表示拒绝，operation 表示读取当前状态。
+            operation_id: 待处理的后端操作 ID。
+            args: 提交时为已展示的准备参数；拒绝时为包含 reason 的字典；
+                对账时为空字典。
+
+        Returns:
+            后端操作记录，包含动作名称、请求标识、当前状态和业务结果。
+
+        Raises:
+            ValueError: 拒绝原因为空或仅含空白。
+            BusinessError: 身份或归属检查失败，或后端拒绝提交、拒绝操作。
+        """
+        attrs = self._attrs(context, kind, args, kind)
+        attrs["operation_id"] = operation_id
+        with self.trace.span("tool", kind, attrs=attrs) as span:
+            try:
+                user_id = self._identity(context)
+                if kind == "commit":
+                    result = self.backend.commit(user_id, operation_id, args)
+                elif kind == "operation":
+                    result = self.backend.get_operation(user_id, operation_id=operation_id)
+                else:
+                    result = self.backend.reject(user_id, operation_id, args["reason"])
+            except BusinessError as exc:
+                span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                self.records.append(deepcopy(span.attrs))
+                raise
+            span.attrs.update(
+                action=result["action"],
+                result=deepcopy(result),
+                status=result["status"],
+                request_key=result["request_key"],
+            )
+            self.records.append(deepcopy(span.attrs))
+            return result

@@ -20,7 +20,13 @@ class LLMClient:
     def __init__(
         self, config: AppConfig, trace: Trace, backend: CompatibleModel | FakeModel
     ) -> None:
-        """绑定模型档位及重试配置、运行轨迹和后端；此时不发出模型请求。"""
+        """绑定运行配置、轨迹和模型后端。
+
+        Args:
+            config: 模型档位、超时和重试设置。
+            trace: 接收模型调用轨迹、原文和用量记录的会话轨迹。
+            backend: 执行模型请求的真实后端或脚本化假模型，生命周期由调用者管理。
+        """
         self.config = config
         self.trace = trace
         self.backend = backend

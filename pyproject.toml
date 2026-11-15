@@ -7,11 +7,18 @@ name = "ttwill"
 version = "0.1.0"
 description = "面向买家的多品类电商客服 Agent"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "MIT"
 dependencies = [
     "httpx>=0.28,<1",
     "python-dotenv>=1,<2",
+    "sqlalchemy>=2.0,<3",
+    "pydantic>=2.12,<3",
+]
+
+[project.optional-dependencies]
+bench = [
+    "tau2 @ git+https://github.com/sierra-research/tau2-bench.git@c06b07dd7c4d4ec61ba6ff9bcdf0b15dd7ef36d4",
 ]
 
 [project.scripts]
@@ -25,6 +32,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ttwill"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

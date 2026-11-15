@@ -1,3 +1,5 @@
+"""验证演示与轨迹命令在项目目录之外也能完整运行。"""
+
 import json
 import subprocess
 import sys
@@ -5,6 +7,7 @@ from pathlib import Path
 
 
 def test_demo_and_trace_commands_work_outside_project(tmp_path: Path) -> None:
+    """演示生成模型记录与用量账本，轨迹查看命令可从项目外读取结果。"""
     root = Path(__file__).resolve().parents[2]
     config_dir = tmp_path / "configuration"
     config_dir.mkdir()
