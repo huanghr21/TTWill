@@ -2,7 +2,7 @@
 
 面向买家的多品类电商客服 Agent：理解意愿，完成所托。
 
-当前实现第 0～1 步：最小 Python 包、配置读取、统一模型调用、假模型、轨迹及命令行查看。业务后端、子 Agent 和协调者按[实施计划](<docs/05 实施计划.md>)继续开发，项目设计见[文档导航](<docs/00 项目定位.md#文档导航>)。
+当前实现到第 3 步：业务后端、按实例加载 Skill、订单服务与售后子 Agent。协调者和对话确认按[实施计划](<docs/05 实施计划.md>)继续开发，设计见[文档导航](<docs/00 项目定位.md#文档导航>)。`retail_50` 实测 48/50 终态一致，另两题已确认为上游缺陷，原始差异单列保留。
 
 ## 安装与检查
 
@@ -16,9 +16,74 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-`uv.lock` 固定依赖版本。运行依赖仅为 HTTPX（兼容接口请求）和 python-dotenv（本地密钥读取）；开发依赖为 pytest、Ruff，构建使用 Hatchling。本阶段不需要 τ²、LangGraph 或数据库依赖。
+`uv.lock` 固定依赖版本。运行依赖为 HTTPX（兼容接口请求）、python-dotenv（本地密钥读取）、SQLAlchemy（SQLite 事务）和 Pydantic（工具参数与结构定义）；开发依赖为 pytest、Ruff，构建使用 Hatchling。普通业务运行不需要 τ²；离线参考校验单独安装 `bench` 可选依赖。尚未引入 LangGraph。
+
+## 命令行业务入口
+
+从固定中文包初始化一个独立业务库，再按邮箱验证身份并查询。以下数据均来自基准的合成数据：
+
+```bash
+uv run ttwill business init --db runs/manual/business.sqlite
+uv run ttwill business query --db runs/manual/business.sqlite \
+  --email xue.cao2645@example.com --tool get_order_details \
+  --args '{"order_id":"#W5918442"}'
+uv run ttwill business prepare --db runs/manual/business.sqlite \
+  --email xue.cao2645@example.com --tool cancel_pending_order \
+  --task-id manual-cancel-1 --revision 1 \
+  --args '{"order_id":"#W5918442","reason":"no longer needed"}'
+```
+
+准备只记录操作，返回 `operation_id`、`request_key`、原参数、期限与 `preview`，业务数据不变。
+检查输出后，在新命令中传入返回的操作 ID 和同一份参数：
+
+```bash
+uv run ttwill business commit --db runs/manual/business.sqlite \
+  --email xue.cao2645@example.com --operation-id '<准备返回的 operation_id>' \
+  --args '{"order_id":"#W5918442","reason":"no longer needed"}'
+uv run ttwill business operation --db runs/manual/business.sqlite \
+  --email xue.cao2645@example.com --request-key '<准备返回的 request_key>'
+```
+
+取消准备使用 `business reject --operation-id ... --reason ...`，同样提供 `--db`、`--email`。
+每条命令重新验证身份并保存轨迹；可用 `--config` 指定配置文件。业务库与初始化的来源路径以当前目录为准，轨迹目录以及 `skills/`、`data/source/` 资源目录以配置文件所在目录为准。初始化不覆盖已有业务数据。诊断用的 `business prepare` 会显式加载对应 Skill；子 Agent 则需要自己调用 `load_skill`。
+
+同一任务 ID、修订号和动作产生同一请求标识，跨进程重试返回原操作，重复提交不重复退款。
+同一订单在准备至提交、拒绝、过期或确定失败之间只允许一个待提交操作。请求改动或失效后重新办理时递增修订号。
+准备有效期由 `[backend].operation_ttl_seconds` 设置，当前开发配置为 900 秒；它不代表用户的对话授权。
+这里的显式提交用于后端验收，第 4 步再实现“最近回复展示 → 用户确认 → 代码提交”的对话护栏。
+
+## 离线参考动作校验
+
+```bash
+uv sync --locked --extra bench
+uv run --extra bench pytest
+uv run --extra bench ttwill bench --output runs/reference-001
+```
+
+重放目录必须是新目录。每题新建业务库，正常导入固定提交的官方工具执行同一参考动作，
+使用官方 `RetailDB.get_hash()` 比较完整终态，同时检查动作返回值和七个读工具。
+这一步不调用模型；τ² 导入使用本地成本表。来源、文件校验值和许可证见 [data/README.md](data/README.md)。
+
+2026-11-15 实测：50 题均完成重放，48 题终态及动作返回值一致，七个读工具全部一致，七个写工具均被覆盖。
+`21_zh_identity`、`36_zh_identity` 的差异来自上游批量修改商品时复用最后一个规格，
+详见[上游差异记录](<docs/07 调研_tau2-bench.md#第-2-步实测差异>)。
+完整报告保留所有差异；存在任一终态、动作或读取差异时，命令退出码仍为 1，表示没有达到完全一致。第 2 步验收已接受上述两项已知差异，不将 48/50 改写成 50/50。
+这些数据是无模型的后端一致性结果，不是含自然语言断言的 Agent 任务成功率。
 
 ## 假模型演示
+
+单独派发订单服务或售后任务：
+
+```bash
+uv run ttwill agent-demo --capability order_service
+uv run ttwill agent-demo --capability after_sales
+```
+
+每次演示创建独立业务库，用假模型依次查询订单、加载 Skill、准备取消或退货，再返回结构化结果；业务状态保持原样。输出包含 `result`、业务库和轨迹路径，状态应为 `need_confirm`。`actions`、业务事实和待确认参数由网关与后端记录填写；模型只提供 `missing`、`message_hint`，不能填写完成状态或调用提交工具。
+
+子 Agent 的循环由 `[agent].max_steps` 限制，开发默认 12 步。每个工具调用计一步，无工具回复也计一步；超限会返回 `failed`，作废本实例尚未提交的准备项，并记录 guard。实例结束即清除 Skill 加载记录，下一实例重新加载。政策正文保留固定来源中的英文，中文操作要点单独放在 `skills/`。
+
+轨迹包含 `session → turn → dispatch → subagent → llm / tool / guard / result`。查看轨迹，或运行只包含一次模型调用的基础设施演示：
 
 ```bash
 uv run ttwill demo

@@ -68,7 +68,7 @@ TTWill 改为**任务驱动的多 Agent**：
 | `description` | 给协调者看：适合处理什么任务 |
 | `prompt` / `skills` | 系统提示词；本能力可加载的 Skill 列表 |
 | `tools` | 工具白名单，并标注读 / 写 |
-| `output_schema` | 结构化返回格式 |
+| `output_schema` | 结构化返回约定；MVP 两种能力共用运行时代码的格式，不在每条能力记录里重复保存 |
 | `model_tier` | 默认模型档位（如 flash / strong） |
 
 ### MVP 的能力划分
@@ -88,10 +88,10 @@ TTWill 改为**任务驱动的多 Agent**：
 {
   "task_id": "t2",
   "status": "need_confirm",
-  "actions": [{"tool": "exchange_delivered_order_items", "args": {}, "result": "prepared", "operation_id": "op_7f3a"}],
+  "actions": [{"tool": "exchange_delivered_order_items", "args": {}, "status": "prepared", "result": {"status": "prepared"}, "operation_id": "op_7f3a"}],
   "facts": [],
   "missing": [],
-  "pending_confirmation": {"operation_id": "op_7f3a", "summary": "将耳机换成黑色款，差价 ¥0", "action": {}},
+  "pending_confirmation": [{"operation_id": "op_7f3a", "action": "exchange_delivered_order_items", "args": {}, "preview": {}}],
   "message_hint": "给用户的关键信息要点（由协调者组织最终回复）"
 }
 ```
@@ -100,12 +100,16 @@ TTWill 改为**任务驱动的多 Agent**：
 | --- | --- |
 | 任务新增 / 修改 / 撤销提议、`missing`、`message_hint` | 模型提出，代码校验后更新对应内容 |
 | `task_id`、任务修订号 `revision`、身份、能力与实例 ID | 运行时代码维护，不能由模型伪造或覆盖 |
-| `actions`、工具参数与执行结果、操作 ID、待确认详情 | 代码从网关与后端返回记录填入；D 组子 Agent 的写动作只能是准备结果 |
+| `actions`、工具参数与执行结果、操作 ID、待确认详情 | 代码从网关与后端返回记录填入；D 组子 Agent 只能发起准备，重试可找回已提交状态，异常清理可记录拒绝结果，不能自行提交 |
 | 业务事实 `facts` | 代码记录实际工具返回及其来源，模型不能把推测写成已验证事实 |
 | 执行状态与失败原因 | 运行时根据实际执行记录更新，模型不能直接声明已执行 |
 | 写任务的 `done` | 仅执行后核验代码可以设置；准备成功、模型声称成功或后端已提交都不等于核验完成 |
 
 模型仍负责理解诉求、选择工具和判断自然语言条件；这里限制的是**可信状态的写入权**。确认判定器按下文约定使用规则或 LLM 判定用户原话，判定结果由护栏代码消费，不能通过普通任务更新接口伪造授权。
+
+第 3 步的结束接口为 `finish(missing, message_hint)`，也接受同结构的 JSON 回复；多余字段和类型不符会被拒绝并反馈给模型，消耗循环预算。`finish` 必须单独调用。`pending_confirmation` 使用列表完整保留实际准备项，参数与预览来自后端；模型要点不作为确认凭据。模型对任务的增改撤提议由第 4 步协调者处理。
+
+本次派工状态由代码计算：`need_confirm` 表示存在待确认准备项，`needs_verification` 表示重试找到已提交操作，`need_info` 表示仍缺信息，`ready` 仅表示只读派工拿到了业务查询结果，`failed` 表示超限或没有取得所需进展。它们是派工结果，不直接将写任务标为 `done`。
 
 ## “派几个实例”的含义
 
@@ -280,6 +284,8 @@ Skill 文件只**引用政策章节名**，不复制原文。加载器先按下�
 
 排除清单用于加载器显式过滤，不通过改写原始政策文件实现。
 
+当前固定中文包中的政策正文仍为英文，按原文加载；中文只用于 Skill 操作要点。章节提取与两项排除文本位于 `bench/policy.py`，通用加载器接收章节字典和排除清单。默认用户地址没有独立专章，相关 Skill 的章节引用为空，适用规则保留在常驻政策中。
+
 ### 加载机制
 
 1. 子 Agent 的提示词只列出**本能力范围内**的 Skill 目录（名称 + 一句话描述）；
@@ -289,17 +295,17 @@ Skill 文件只**引用政策章节名**，不复制原文。加载器先按下�
 
 协调者派出子 Agent 时，代码构造“会话身份 + 能力 + 实例 ID”的调用上下文；网关据此校验能力白名单。Skill 加载记录按**实例**保存，实例销毁时清除，不因同一会话中的其他实例读过政策而解锁。子 Agent 不持久化，后续分派的新实例重新按需加载自己的 Skill。
 
-Skill 文件格式（示意）：
+Skill 使用 TOML 前导元数据，两个 `+++` 之间由标准库解析。文件格式（示意）：
 
 ```text
 skills/return_delivered_order/SKILL.md
----
-name: return_delivered_order
-description: 已送达订单的退货（商品清单、退款去向限制）
-capability: after_sales
-tools: return_delivered_order_items
-policy_sections: Return delivered order
----
++++
+name = "return_delivered_order"
+description = "已送达订单的退货（商品清单、退款去向限制）"
+capability = "after_sales"
+tools = ["return_delivered_order_items"]
+policy_sections = ["Return delivered order"]
++++
 1. 先查订单，确认状态为 delivered……
 2. 收集该订单所有要退的商品……
 3. 退款去向只能是原支付方式或已有礼品卡……
@@ -461,6 +467,8 @@ BM25 + 向量 + RRF + 交叉编码器重排，是 2026 年较公认的混合检�
 `core/` 直接使用 LangGraph 的 checkpointer；`persistence/` 只提供检查点存储的初始化及对话、摘要所需的小型存取模块，不再包装通用持久化 Protocol。子 Agent 用完即销毁，不保存或恢复其实例上下文及 Skill 加载记录。
 
 运行配置提供两个循环上限：**每个子 Agent 工具循环的步数**、**每轮用户消息最多进行的分派轮数**。触及上限后若仍需继续执行，代码将受影响的未完成任务标记为 `failed`、记录具体原因和 `guard` span，由协调者说明情况或按政策转人工；已有的确定结果保留，写入结果未知的操作先对账。上限数值在配置中设置，不硬编码在循环里。
+
+第 3 步先接入 `[agent].max_steps`，开发默认值为 12：每个工具调用计一步，没有工具调用的回复也计一步；同轮多个调用逐个计数，不能批量绕过上限。正常结束保留准备项；超限、取消或异常退出时作废本实例尚未提交的准备项，并清除 Skill 加载记录。每轮分派轮数上限随第 4 步协调者接入。
 
 ## EchoMind 模块的保留与删除
 
