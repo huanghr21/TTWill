@@ -7,7 +7,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from ttwill.backend import BusinessError, RetailBackend
-from ttwill.bootstrap import business_runtime, run_agent_demo, run_coordinator_demo
+from ttwill.bootstrap import (
+    business_runtime,
+    run_agent_demo,
+    run_coordinator_demo,
+    run_runtime_demo,
+)
 from ttwill.config import load_config
 from ttwill.gateway import AFTER_SALES_WRITES, READ_TOOLS, WRITE_TOOLS, CallContext
 from ttwill.llm import FakeModel, LLMClient
@@ -201,6 +206,10 @@ def main() -> None:
         "coordinator-demo", help="用假模型演示请求、确认与核验的两轮对话"
     )
     coordinator_demo.add_argument("--config", type=Path, default=Path("config.toml"))
+    runtime_demo = subparsers.add_parser(
+        "runtime-demo", help="用假模型演示跨会话恢复、重新展示与确认核验"
+    )
+    runtime_demo.add_argument("--config", type=Path, default=Path("config.toml"))
     trace = subparsers.add_parser("trace", help="离线查看会话 JSONL 轨迹树")
     trace.add_argument("path", type=Path, help="会话轨迹文件")
     _business_parser(subparsers)
@@ -224,6 +233,10 @@ def main() -> None:
                 json.dumps(
                     asyncio.run(run_coordinator_demo(args.config)), ensure_ascii=False, indent=2
                 )
+            )
+        elif args.command == "runtime-demo":
+            print(
+                json.dumps(asyncio.run(run_runtime_demo(args.config)), ensure_ascii=False, indent=2)
             )
         elif args.command == "trace":
             print(render_tree(args.path))

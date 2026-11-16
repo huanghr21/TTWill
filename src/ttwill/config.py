@@ -76,6 +76,21 @@ class AgentConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextConfig:
+    """协调上下文的字符预算与历史压缩设置。
+
+    Attributes:
+        max_chars: 消息和工具定义序列化后的字符上限，不等同于模型 token 数。
+        recent_turns: 必须保留完整原文的近期历史轮数，允许为 0。
+        summary_tier: 仅在引用化后仍超预算时调用的摘要模型档位。
+    """
+
+    max_chars: int = 64000
+    recent_turns: int = 4
+    summary_tier: str = "flash"
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """解析后的运行配置，不包含密钥值。
 
@@ -86,6 +101,7 @@ class AppConfig:
         models: 按模型档位名称索引的模型配置。
         backend: 业务操作的准备有效期设置。
         agent: 子 Agent 单次派工的步数上限。
+        context: 协调上下文的字符预算与摘要设置。
     """
 
     root: Path
@@ -94,6 +110,7 @@ class AppConfig:
     models: dict[str, ModelConfig]
     backend: BackendConfig = field(default_factory=BackendConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
 
 
 _RESERVED_PARAMETERS = {"model", "messages", "tools", "stream", "timeout"}
@@ -272,7 +289,7 @@ def load_config(path: Path) -> AppConfig:
     path = path.resolve()
     with path.open("rb") as file:
         data = tomllib.load(file)
-    _check_keys(data, "配置", {"runs_dir", "llm", "models"}, {"backend", "agent"})
+    _check_keys(data, "配置", {"runs_dir", "llm", "models"}, {"backend", "agent", "context"})
     root = path.parent
     runs_dir = (root / _text(data["runs_dir"], "runs_dir")).resolve()
     llm = _table(data["llm"], "llm")
@@ -309,6 +326,17 @@ def load_config(path: Path) -> AppConfig:
     max_rounds = agent.get("max_rounds", 8)
     if type(max_rounds) is not int or max_rounds < 1:
         raise ConfigError("agent.max_rounds 必须是正整数")
+    context = _table(data.get("context", {}), "context")
+    _check_keys(context, "context", set(), {"max_chars", "recent_turns", "summary_tier"})
+    max_chars = context.get("max_chars", 64000)
+    recent_turns = context.get("recent_turns", 4)
+    summary_tier = _text(context.get("summary_tier", "flash"), "context.summary_tier")
+    if type(max_chars) is not int or max_chars < 1:
+        raise ConfigError("context.max_chars 必须是正整数")
+    if type(recent_turns) is not int or recent_turns < 0:
+        raise ConfigError("context.recent_turns 必须是非负整数")
+    if summary_tier not in parsed_models:
+        raise ConfigError("context.summary_tier 必须引用已配置的模型档位")
     return AppConfig(
         root=root,
         runs_dir=runs_dir,
@@ -316,4 +344,7 @@ def load_config(path: Path) -> AppConfig:
         models=parsed_models,
         backend=backend_config,
         agent=AgentConfig(max_steps=max_steps, max_rounds=max_rounds),
+        context=ContextConfig(
+            max_chars=max_chars, recent_turns=recent_turns, summary_tier=summary_tier
+        ),
     )

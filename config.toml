@@ -6,6 +6,12 @@ max_steps = 12
 # 每条用户消息最多进行的协调决策轮数，每轮至多分派一批任务。
 max_rounds = 8
 
+[context]
+# 计入消息与工具定义的 JSON 字符数，不是模型 token 数。
+max_chars = 64000
+recent_turns = 4
+summary_tier = "flash"
+
 [backend]
 operation_ttl_seconds = 900
 

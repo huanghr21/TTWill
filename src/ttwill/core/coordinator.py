@@ -47,12 +47,12 @@ class Reply(BaseModel):
 
 @dataclass
 class ConversationState:
-    """保存一次运行中的对话与可信任务状态，第 5 步再接入检查点。
+    """保存协调者使用的对话与可信任务状态，由运行时决定内存或检查点生命周期。
 
     Attributes:
         session: 本段聊天的身份，由网关验证。
         tasks: 代码维护的任务集合。
-        history: 实际接收和发出的用户、助手消息，仅驻留内存。
+        history: 直接调用时的消息历史；持久运行时完整原文另存对话档案。
         last_display: 最近一次助手回复实际展示的操作及参数快照。
         turn: 已开始处理的用户消息数。
     """
@@ -62,6 +62,35 @@ class ConversationState:
     history: list[dict] = field(default_factory=list)
     last_display: list[dict] = field(default_factory=list)
     turn: int = 0
+
+
+@dataclass
+class TurnState:
+    """保存一条用户消息内的协调进度，供图节点之间写入检查点。
+
+    Attributes:
+        user_message: 本轮真实用户原话，独立确认只读取此字段。
+        instance_id: 本轮协调实例标识，不参与业务准备的确定性请求键。
+        previous: 本轮开始时保留的上一回复实际展示快照。
+        messages: 未压缩的本轮模型与工具往返，持久运行时同时归档。
+        base_messages: 初始提示与历史占用的消息数，之后的条目属于本轮往返。
+        confirmed: 是否已完成本轮独立确认判定。
+        decisions: 本轮逐操作确认与执行结果。
+        rounds: 已使用的协调决策次数。
+        invalid_outputs: 不合格的模型原文，仅供档案观察，不作为可执行工具往返。
+        result: 本轮已生成的回复；None 表示还需继续决策。
+    """
+
+    user_message: str
+    instance_id: str
+    previous: list[dict]
+    messages: list[dict]
+    base_messages: int
+    confirmed: bool = False
+    decisions: list[dict] = field(default_factory=list)
+    rounds: int = 0
+    invalid_outputs: list[dict] = field(default_factory=list)
+    result: dict | None = None
 
 
 class Coordinator:
@@ -97,150 +126,187 @@ class Coordinator:
         self.judge = judge or ConfirmationJudge(llm, model_tier=model_tier)
 
     async def handle_turn(self, state: ConversationState, user_message: str) -> dict:
-        """处理一条真实用户消息，返回回复与可信任务快照。
-
-        先允许模型提出本轮全部改口或撤销；complete_plan 后才判定上一回复的
-        操作。模型不能提供确认结果，不能调用提交。未完成工作会阻止提前回复。
+        """在内存中处理一条真实用户消息，复用持久运行时的逐轮执行接口。
 
         Args:
-            state: 当前聊天的内存状态，原地更新，不写独立任务状态文件。
+            state: 当前聊天状态，原地更新；此入口不保存检查点。
             user_message: 调用入口收到的真实用户原话，不得替换成模型摘要。
 
         Returns:
-            包含 reply、tasks、displayed、confirmation_results、rounds 的字典；
-            displayed 仅列本次实际回复中出现的操作，供下一条消息判定。
+            含 reply、tasks、displayed、confirmation_results、rounds 的回复字典。
 
         Raises:
             ValueError: 用户消息为空。
             asyncio.CancelledError: 本轮调用被取消。
-            OSError: 业务或轨迹读写失败；提交结果未知时保留待对账状态。
+            OSError: 业务或轨迹读写失败；保留已知操作引用供对账。
         """
-        if not user_message.strip():
+        with self.gateway.trace.span("turn", "处理用户消息", turn=state.turn + 1):
+            with self.gateway.trace.span("coordinator", "任务协调"):
+                work = self.begin_turn(state, user_message)
+                while work.result is None:
+                    await self.advance_turn(state, work)
+                return work.result
+
+    def begin_turn(self, state: ConversationState, user_message: str) -> TurnState:
+        """建立本轮进度并对账已有操作，不分派子 Agent。
+
+        Args:
+            state: 本轮会话与任务状态，原地递增轮次并记录用户原话。
+            user_message: 当前入口收到的非空用户消息。
+
+        Returns:
+            新的协调进度；持久运行时在进入首个决策节点前保存该进度。
+
+        Raises:
+            ValueError: 用户消息不是非空字符串。
+            BusinessError: 已有操作无法按当前身份对账。
+            OSError: 对账或轨迹读写失败。
+        """
+        if not isinstance(user_message, str) or not user_message.strip():
             raise ValueError("用户消息不能为空")
         state.turn += 1
         previous = deepcopy(state.last_display)
         state.last_display = []
         state.history.append({"role": "user", "content": user_message})
-        context = CallContext(state.session, "coordinator", uuid4().hex)
-        confirmed = False
-        decisions = []
-        with self.gateway.trace.span("turn", "处理用户消息", turn=state.turn):
-            with self.gateway.trace.span("coordinator", "任务协调"):
-                self._reconcile(state, context)
-                messages = self._messages(state)
-                for round_number in range(1, self.max_rounds + 1):
-                    try:
-                        response = await self.llm.complete(
-                            self.model_tier, messages, tools=self._schemas(context, confirmed)
+        instance_id = uuid4().hex
+        self._reconcile(state, CallContext(state.session, "coordinator", instance_id))
+        messages = self._messages(state)
+        return TurnState(user_message, instance_id, previous, messages, len(messages))
+
+    async def advance_turn(
+        self, state: ConversationState, work: TurnState, *, messages: list[dict] | None = None
+    ) -> None:
+        """执行一次协调决策；任务更新与后续分派分属不同调用。
+
+        Args:
+            state: 当前会话与任务状态，工具执行结果写回此对象。
+            work: 原地更新的本轮进度；产生最终回复时写入 result。
+            messages: 上下文编译器本次生成的模型输入；None 时使用完整原始消息。
+                确认判定始终使用 work.user_message 与 work.previous。
+
+        Raises:
+            ValueError: 本轮已结束，不能继续推进。
+            asyncio.CancelledError: 调用被取消，实例收尾后向上传播。
+            OSError: 业务或轨迹读写失败；图运行时保留上一个成功节点的检查点。
+        """
+        if work.result is not None:
+            raise ValueError("本轮已结束")
+        if work.rounds >= self.max_rounds:
+            self.stop_turn(state, work, f"协调者达到本轮上限 {self.max_rounds}，未完成本轮处理")
+            return
+        context = CallContext(state.session, "coordinator", work.instance_id)
+        work.rounds += 1
+        try:
+            response = await self.llm.complete(
+                self.model_tier,
+                work.messages if messages is None else messages,
+                tools=self._schemas(context, work.confirmed),
+            )
+        except (LLMError, TimeoutError) as exc:
+            self.stop_turn(state, work, f"协调模型调用失败：{type(exc).__name__}")
+            return
+        calls = response.message.get("tool_calls") or []
+        if len(calls) != 1:
+            work.invalid_outputs.append(deepcopy(response.message))
+            self._guard(
+                "coordinator_format", "每轮须调用一个协调工具，可在 dispatch_tasks 中批量分派"
+            )
+            work.messages.append(
+                {
+                    "role": "user",
+                    "content": "请只调用一个工具。需要多个任务时在同一 dispatch_tasks 中列出。",
+                }
+            )
+        else:
+            work.messages.append(deepcopy(response.message))
+            call = calls[0]
+            name = call["function"]["name"]
+            try:
+                arguments = json.loads(call["function"]["arguments"])
+                if not isinstance(arguments, dict):
+                    raise ValueError("工具参数必须是对象")
+                if name == "update_tasks":
+                    self._require_identity(state)
+                    updates = UpdateTasks.model_validate(arguments)
+                    for change in updates.changes:
+                        if change.capability is not None:
+                            self.runner.registry.get(change.capability)
+                    outcome = state.tasks.apply(updates.changes, self.gateway, context)
+                elif name == "complete_plan":
+                    CompletePlan.model_validate(arguments)
+                    if work.confirmed:
+                        raise ValueError("本轮已经判定过用户确认")
+                    work.decisions = await self._confirm(
+                        state, context, work.user_message, work.previous
+                    )
+                    work.confirmed = True
+                    outcome = {
+                        "confirmation_results": work.decisions,
+                        "tasks": state.tasks.snapshot(),
+                    }
+                elif name == "dispatch_tasks":
+                    self._require_identity(state)
+                    if not work.confirmed:
+                        raise ValueError("先提出所有任务修改并调用 complete_plan，再分派")
+                    selection = DispatchTasks.model_validate(arguments)
+                    outcome = await self._dispatch(state, context, selection.task_ids)
+                elif name == "reply":
+                    proposal = Reply.model_validate(arguments)
+                    if not work.confirmed:
+                        raise ValueError("先提出所有任务修改并调用 complete_plan，再回复")
+                    self._reconcile(state, context)
+                    unfinished = self._actionable(state)
+                    if unfinished:
+                        raise ValueError(
+                            f"任务仍需推进或判断条件：{unfinished}；先分派、补充缺失信息或撤销不再需要的条件分支"
                         )
-                    except (LLMError, TimeoutError) as exc:
-                        reason = f"协调模型调用失败：{type(exc).__name__}"
-                        self._fail_unfinished(state, context, reason)
-                        return self._reply(
-                            state,
-                            context,
-                            Reply(message_hint=""),
-                            decisions,
-                            round_number,
-                            notice=reason,
-                        )
-                    calls = response.message.get("tool_calls") or []
-                    if len(calls) != 1:
-                        self._guard(
-                            "coordinator_format",
-                            "每轮须调用一个协调工具，可在 dispatch_tasks 中批量分派",
-                        )
-                        messages.append(
+                    work.result = self._reply(state, context, proposal, work.decisions, work.rounds)
+                    outcome = {"replied": True}
+                elif name in {
+                    schema["function"]["name"] for schema in self.gateway.schemas(context)
+                }:
+                    outcome = self.gateway.call(context, name, arguments)
+                else:
+                    raise ValueError(f"当前阶段没有工具：{name}")
+            except ValueError as exc:
+                self._guard("coordinator_tool", str(exc))
+                outcome = {"error": getattr(exc, "code", "invalid_tool_call"), "reason": str(exc)}
+            work.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": json.dumps(outcome, ensure_ascii=False),
+                }
+            )
+            if work.result is None:
+                work.messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
                             {
-                                "role": "user",
-                                "content": (
-                                    "请只调用一个工具。需要多个任务时在同一 dispatch_tasks 中列出。"
-                                ),
-                            }
-                        )
-                        continue
-                    messages.append(deepcopy(response.message))
-                    call = calls[0]
-                    name = call["function"]["name"]
-                    try:
-                        arguments = json.loads(call["function"]["arguments"])
-                        if not isinstance(arguments, dict):
-                            raise ValueError("工具参数必须是对象")
-                        if name == "update_tasks":
-                            self._require_identity(state)
-                            updates = UpdateTasks.model_validate(arguments)
-                            for change in updates.changes:
-                                if change.capability is not None:
-                                    self.runner.registry.get(change.capability)
-                            outcome = state.tasks.apply(updates.changes, self.gateway, context)
-                        elif name == "complete_plan":
-                            CompletePlan.model_validate(arguments)
-                            if confirmed:
-                                raise ValueError("本轮已经判定过用户确认")
-                            decisions = await self._confirm(state, context, user_message, previous)
-                            confirmed = True
-                            outcome = {
-                                "confirmation_results": decisions,
                                 "tasks": state.tasks.snapshot(),
-                            }
-                        elif name == "dispatch_tasks":
-                            self._require_identity(state)
-                            if not confirmed:
-                                raise ValueError("先提出所有任务修改并调用 complete_plan，再分派")
-                            selection = DispatchTasks.model_validate(arguments)
-                            outcome = await self._dispatch(state, context, selection.task_ids)
-                        elif name == "reply":
-                            proposal = Reply.model_validate(arguments)
-                            if not confirmed:
-                                raise ValueError("先提出所有任务修改并调用 complete_plan，再回复")
-                            self._reconcile(state, context)
-                            unfinished = self._actionable(state)
-                            if unfinished:
-                                raise ValueError(
-                                    f"任务仍需推进或判断条件：{unfinished}；先分派、补充缺失信息或撤销不再需要的条件分支"
-                                )
-                            return self._reply(state, context, proposal, decisions, round_number)
-                        elif name in {
-                            schema["function"]["name"] for schema in self.gateway.schemas(context)
-                        }:
-                            outcome = self.gateway.call(context, name, arguments)
-                        else:
-                            raise ValueError(f"当前阶段没有工具：{name}")
-                    except ValueError as exc:
-                        self._guard("coordinator_tool", str(exc))
-                        outcome = {
-                            "error": getattr(exc, "code", "invalid_tool_call"),
-                            "reason": str(exc),
-                        }
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": json.dumps(outcome, ensure_ascii=False),
-                        }
-                    )
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tasks": state.tasks.snapshot(),
-                                    "verified": state.session.user_id is not None,
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
-                reason = f"协调者达到本轮上限 {self.max_rounds}，未完成本轮处理"
-                self._fail_unfinished(state, context, reason)
-                return self._reply(
-                    state,
-                    context,
-                    Reply(message_hint=""),
-                    decisions,
-                    self.max_rounds,
-                    notice=reason,
+                                "verified": state.session.user_id is not None,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
                 )
+        if work.result is None and work.rounds == self.max_rounds:
+            self.stop_turn(state, work, f"协调者达到本轮上限 {self.max_rounds}，未完成本轮处理")
+
+    def stop_turn(self, state: ConversationState, work: TurnState, reason: str) -> None:
+        """说明本轮无法继续的原因，终止可推进任务并保留已等待用户的结果。
+
+        Args:
+            state: 要原地更新的会话与任务状态。
+            work: 本轮进度，最终回复写入 result。
+            reason: 代码确定的超限、上下文或模型调用失败原因。
+        """
+        context = CallContext(state.session, "coordinator", work.instance_id)
+        self._fail_unfinished(state, context, reason)
+        work.result = self._reply(
+            state, context, Reply(message_hint=""), work.decisions, work.rounds, notice=reason
+        )
 
     def _messages(self, state: ConversationState) -> list[dict]:
         """组装固定政策、历史和本轮可信任务快照。

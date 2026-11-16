@@ -11,11 +11,15 @@ from ttwill.backend import RetailBackend
 from ttwill.bench.policy import extract_policy
 from ttwill.bench.retail import load_retail_bundle
 from ttwill.config import load_config
+from ttwill.core.context import ContextCompiler
 from ttwill.core.coordinator import ConversationState, Coordinator
+from ttwill.core.runtime import PersistentRuntime
 from ttwill.core.subagent import DispatchTask, SubAgentRunner
 from ttwill.gateway import CallContext, SessionContext, ToolGateway
 from ttwill.gateway.skills import SkillCatalog
 from ttwill.llm import FakeModel, LLMClient
+from ttwill.persistence import Archive
+from ttwill.persistence.checkpoints import open_checkpointer
 from ttwill.tracing import Trace
 
 
@@ -279,6 +283,159 @@ async def run_agent_demo(config_path: Path, capability: str) -> dict:
         return {"result": result, "database": str(database), "trace": str(trace.path)}
     finally:
         backend.close()
+
+
+async def run_runtime_demo(config_path: Path) -> dict:
+    """演示关闭运行时后重开同一业务任务、重验身份和重新展示待确认操作。
+
+    第一段聊天准备取消订单后关闭数据库与检查点连接；第二段重新打开这些
+    文件，先重新展示，再接收下一条真实确认并由代码提交、核验。
+
+    Args:
+        config_path: 包含模型档位、循环和上下文预算的 TOML 配置路径，种子
+            与 Skill 资源相对于配置所在目录读取。
+
+    Returns:
+        包含 turns、database、checkpoint、archive、traces 的字典；三轮结果
+        依次是首次展示、恢复后重新展示、用户确认后的提交核验。
+
+    Raises:
+        ValueError: 配置、业务种子、Skill 或假模型脚本不符合运行接口。
+        LLMError: 假模型响应脚本耗尽或返回格式不合法。
+        OSError: 资源无法读取，或业务库、检查点、档案、轨迹无法写入。
+    """
+    config = load_config(config_path)
+    bundle = load_retail_bundle(config.root / "data" / "source")
+    skills = load_skills(config.root)
+    order = next(
+        order
+        for order in bundle.database["orders"].values()
+        if order["status"] == "pending" and len(order["payment_history"]) == 1
+    )
+    order_id = order["order_id"]
+    user = bundle.database["users"][order["user_id"]]
+    run_id = f"runtime-demo-{uuid4().hex}"
+    run_dir = config.runs_dir / run_id
+    database = run_dir / "business.sqlite"
+    checkpoint = run_dir / "checkpoints.sqlite"
+    archive_path = run_dir / "archive.sqlite"
+    turns, traces = [], []
+    for session_index in range(2):
+        trace = Trace(run_dir, uuid4().hex, run_id=run_id)
+        traces.append(str(trace.path))
+        backend = RetailBackend(database, ttl_seconds=config.backend.operation_ttl_seconds)
+        try:
+            if session_index == 0:
+                backend.initialize(bundle.database)
+            gateway = ToolGateway(backend, trace, skills)
+            child_calls = (
+                [
+                    ("get_order_details", {"order_id": order_id}),
+                    ("load_skill", {"name": skills.required_skill("cancel_pending_order")}),
+                    (
+                        "cancel_pending_order",
+                        {"order_id": order_id, "reason": "no longer needed"},
+                    ),
+                    ("finish", {"missing": [], "message_hint": "请核对取消订单详情。"}),
+                ]
+                if session_index == 0
+                else []
+            )
+            child_llm = LLMClient(
+                config,
+                trace,
+                FakeModel(
+                    _demo_tool_response(name, args, f"runtime-child-{index}")
+                    for index, (name, args) in enumerate(child_calls)
+                ),
+            )
+            runner = SubAgentRunner(
+                build_registry(skills), gateway, child_llm, max_steps=config.agent.max_steps
+            )
+
+            def responses() -> Iterator[dict]:
+                """按当前段聊天生成工具脚本，派工时读取检查点恢复的任务标识。
+
+                Yields:
+                    首段的任务规划、分派和回复，或续办段的重新展示及确认后回复。
+                """
+                if session_index == 0:
+                    yield _demo_tool_response(
+                        "update_tasks",
+                        {
+                            "changes": [
+                                {
+                                    "operation": "add",
+                                    "capability": "order_service",
+                                    "action": "cancel_pending_order",
+                                    "order_id": order_id,
+                                    "instruction": f"取消订单 {order_id}，原因是不再需要。",
+                                }
+                            ]
+                        },
+                        "runtime-plan",
+                    )
+                    yield _demo_tool_response("complete_plan", {}, "runtime-complete-1")
+                    yield _demo_tool_response(
+                        "dispatch_tasks",
+                        {"task_ids": list(runtime.state.tasks.tasks)},
+                        "runtime-dispatch",
+                    )
+                    yield _demo_tool_response(
+                        "reply", {"message_hint": "请核对取消详情。"}, "runtime-reply-1"
+                    )
+                else:
+                    yield _demo_tool_response("complete_plan", {}, "runtime-complete-2")
+                    yield _demo_tool_response(
+                        "reply", {"message_hint": "续办需要重新核对以下详情。"}, "runtime-reply-2"
+                    )
+                    yield _demo_tool_response("complete_plan", {}, "runtime-complete-3")
+                    yield _demo_tool_response(
+                        "reply", {"message_hint": "已核验取消结果。"}, "runtime-reply-3"
+                    )
+
+            coordinator_llm = LLMClient(config, trace, FakeModel(responses()))
+            coordinator = Coordinator(
+                gateway, runner, coordinator_llm, max_rounds=config.agent.max_rounds
+            )
+            with Archive(archive_path) as archive:
+                compiler = ContextCompiler(
+                    archive,
+                    coordinator_llm,
+                    max_chars=config.context.max_chars,
+                    recent_turns=config.context.recent_turns,
+                    summary_tier=config.context.summary_tier,
+                )
+                async with open_checkpointer(checkpoint) as checkpointer:
+                    runtime = PersistentRuntime(
+                        coordinator,
+                        checkpointer,
+                        archive,
+                        thread_id=run_id,
+                        compiler=compiler,
+                    )
+                    with trace.span("session", "可恢复运行时假模型演示"):
+                        await runtime.open_session(
+                            "find_user_id_by_email", {"email": user["email"]}
+                        )
+                        if session_index == 0:
+                            turns.append(
+                                await runtime.send_message(
+                                    f"请取消订单 {order_id}，原因是不再需要。"
+                                )
+                            )
+                        else:
+                            turns.append(await runtime.send_message("继续办理"))
+                            turns.append(await runtime.send_message("确认"))
+        finally:
+            backend.close()
+    return {
+        "turns": turns,
+        "database": str(database),
+        "checkpoint": str(checkpoint),
+        "archive": str(archive_path),
+        "traces": traces,
+    }
 
 
 @contextmanager

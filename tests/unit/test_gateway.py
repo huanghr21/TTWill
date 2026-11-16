@@ -112,6 +112,16 @@ def test_schemas_follow_identity_and_capability(
         assert tool["function"]["parameters"]["additionalProperties"] is False
 
 
+def test_database_path_identifies_business_store_without_allowing_rebind(
+    gateway: ToolGateway, tmp_path: Path
+) -> None:
+    """运行时取得真实业务库绝对路径，属性赋值不能切换网关后端。"""
+    assert gateway.database_path == (tmp_path / "business.sqlite").resolve()
+    assert gateway.database_path.is_file()
+    with pytest.raises(AttributeError):
+        gateway.database_path = tmp_path / "other.sqlite"
+
+
 @pytest.mark.parametrize(
     ("name", "args"),
     [

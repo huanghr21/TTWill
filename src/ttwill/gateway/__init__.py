@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -102,6 +103,15 @@ class ToolGateway:
         self.records: list[dict[str, Any]] = []
         self._loaded: dict[tuple[str, str | None, str, str], set[str]] = {}
         self._validate_skills()
+
+    @property
+    def database_path(self) -> Path:
+        """返回当前业务库的绝对路径，供运行时绑定与核对检查点范围。
+
+        Returns:
+            解析符号链接后的 SQLite 文件路径；该属性不允许重新绑定业务库。
+        """
+        return Path(self.backend.engine.url.database).resolve()
 
     def _validate_skills(self) -> None:
         """启动时核对能力与写工具的 Skill 声明，读取元数据不解锁实例。"""
@@ -363,6 +373,48 @@ class ToolGateway:
             BusinessError: 身份尚未验证、操作不存在，或操作不属于当前用户。
         """
         return self._resolve(context, "operation", operation_id, {})
+
+    def find_operation(self, context: CallContext, action: str) -> dict | None:
+        """由恢复代码重算请求标识，找回尚未写入检查点的后端操作。
+
+        此方法不注册为模型工具；请求标识只取稳定任务 ID、修订号与动作，
+        不包含会话或实例 ID。查询成功不代表用户授权提交。
+
+        Args:
+            context: 已验证身份的代码上下文，包含恢复的任务 ID 和修订号。
+            action: 当前任务的写动作名称。
+
+        Returns:
+            当前请求的完整操作记录；后端尚无该请求时返回 None。
+
+        Raises:
+            BusinessError: 身份未验证、请求关联字段无效，或已有操作属于其他用户。
+        """
+        attrs = self._attrs(context, action, {}, "operation")
+        with self.trace.span("tool", "find_operation", attrs=attrs) as span:
+            try:
+                user_id = self._identity(context)
+                key = request_key(context.task_id, context.revision, action)
+                span.attrs["request_key"] = key
+                try:
+                    result = self.backend.get_operation(user_id, request_key=key)
+                except BusinessError as exc:
+                    if exc.code != "not_found":
+                        raise
+                    span.attrs["status"] = "not_found"
+                    self.records.append(deepcopy(span.attrs))
+                    return None
+            except BusinessError as exc:
+                span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                self.records.append(deepcopy(span.attrs))
+                raise
+            span.attrs.update(
+                operation_id=result["operation_id"],
+                result=deepcopy(result),
+                status=result["status"],
+            )
+            self.records.append(deepcopy(span.attrs))
+            return result
 
     def verify_operation(self, context: CallContext, operation_id: str) -> dict:
         """由代码重读已提交操作的业务实体，核验后返回可信结果。
