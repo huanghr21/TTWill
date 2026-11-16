@@ -2,7 +2,7 @@
 
 面向买家的多品类电商客服 Agent：理解意愿，完成所托。
 
-当前实现到第 4 步：协调者维护任务、分派订单服务与售后实例，按用户确认提交并核验业务结果。任务状态暂存在内存，检查点和跨会话恢复在第 5 步接入，详见[实施计划](<docs/05 实施计划.md>)和[文档导航](<docs/00 项目定位.md#文档导航>)。`retail_50` 实测 48/50 终态一致，另两题已确认为上游缺陷，原始差异单列保留。
+当前实现到第 5 步：LangGraph 检查点保存任务进度，跨会话重新验证身份、对账原业务库并重新展示待确认操作；完整对话归档，上下文超预算时压缩。协调者按用户确认提交，核验通过才完成任务，详见[实施计划](<docs/05 实施计划.md>)和[文档导航](<docs/00 项目定位.md#文档导航>)。`retail_50` 实测 48/50 终态一致，另两题已确认为上游缺陷，原始差异单列保留。
 
 ## 安装与检查
 
@@ -16,7 +16,7 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-`uv.lock` 固定依赖版本。运行依赖为 HTTPX（兼容接口请求）、python-dotenv（本地密钥读取）、SQLAlchemy（SQLite 事务）和 Pydantic（工具参数与结构定义）；开发依赖为 pytest、Ruff，构建使用 Hatchling。普通业务运行不需要 τ²；离线参考校验单独安装 `bench` 可选依赖。尚未引入 LangGraph。
+`uv.lock` 固定依赖版本。运行依赖为 HTTPX（兼容接口请求）、python-dotenv（本地密钥读取）、SQLAlchemy（业务 SQLite 事务）、Pydantic（参数与结构定义）、LangGraph 与 `langgraph-checkpoint-sqlite`（原生异步 SQLite 检查点）；开发依赖为 pytest、Ruff，构建使用 Hatchling。普通业务运行不需要 τ²；离线参考校验单独安装 `bench` 可选依赖。
 
 ## 命令行业务入口
 
@@ -72,6 +72,20 @@ uv run --extra bench ttwill bench --output runs/reference-001
 
 ## 假模型演示
 
+运行包含关闭重开、身份重验与重新展示的跨会话演示：
+
+```bash
+uv run ttwill runtime-demo
+```
+
+第一段聊天准备取消订单并暂停；关闭业务库、档案和检查点连接后，第二段聊天打开同一组文件并重新验身份。新聊天先重新展示原操作，下一条“确认”才提交并核验。三轮输出依次为 `pending_confirm → pending_confirm → done`，任务和操作 ID 保持不变，退款只执行一次；输出包含两段轨迹及业务库、检查点、档案的实际路径。
+
+`PersistentRuntime.open_session()` 先用真实网关查找用户，再读取该线程检查点并校验用户与原业务库路径；`send_message()` 通过 LangGraph 的等待节点接收原话。准备成功但检查点尚无操作 ID 时，按任务 ID、修订号和动作找回操作；提交成功但检查点未更新时，恢复只核验，不再次提交。异常中断后新建运行时并重新打开会话，旧聊天的同意不会被重放。
+
+`[context]` 的开发默认值是 `max_chars = 64000`、`recent_turns = 4`、`summary_tier = "flash"`。预算按消息和工具定义的 JSON 字符数计算，不是 token 数。超限先把旧工具结果替换为档案引用，仍超限才调用一次摘要模型并保存摘要供复用。当前用户原话、任务快照与近期轮次完整保留；无法容纳时明确说明原因并停止本轮。历史摘要不构成确认。
+
+当前运行时支持单进程内同一业务任务串行推进，接续新聊天会使旧实例失去推进资格；多个进程不要同时推进同一任务。不同评测任务使用独立业务库和检查点范围。原有的 `coordinator-demo` 仍是直接调用内存协调器的轻量演示。
+
 运行请求与确认的两轮完整对话：
 
 ```bash
@@ -108,12 +122,17 @@ uv run ttwill trace runs/<run_id>/traces/<session_id>.jsonl
 
 ```text
 runs/<run_id>/
+├── business.sqlite             本次任务的业务记录与准备 / 提交事实
+├── checkpoints.sqlite          LangGraph 任务状态与节点进度，唯一任务恢复来源
+├── archive.sqlite              只追加的完整消息、事件与历史摘要
 ├── traces/<session_id>.jsonl    每个 span 的开始和结束事件
 ├── models/<call_id>-<n>.json    每次尝试的完整请求、响应或错误类型
 └── usage.jsonl                 所有会话、重试的用量、费用与延迟
 ```
 
 相对路径以配置文件所在目录为准；从其他目录启动时传 `ttwill demo --config /绝对路径/config.toml`。轨迹中只保存模型记录的引用，原始请求和响应放在独立文件。查看器会标出尚未结束的 span。
+
+前三个数据库文件由 `runtime-demo` 创建，基础设施演示只创建自身需要的记录。恢复实现使用原生检查点和中断机制，参考 [LangGraph 持久化](https://docs.langchain.com/oss/python/langgraph/persistence)与[中断文档](https://docs.langchain.com/oss/python/langgraph/interrupts)。
 
 ## 模型调用
 
