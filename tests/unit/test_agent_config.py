@@ -35,3 +35,23 @@ def test_unknown_agent_option(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="agent.*未支持"):
         load_config(path)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "true", '"8"'])
+def test_invalid_coordinator_rounds(tmp_path: Path, value: str) -> None:
+    """协调决策轮数必须是正整数，独立于子 Agent 步数。"""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        (ROOT / "config.toml").read_text().replace("max_rounds = 8", f"max_rounds = {value}")
+    )
+    with pytest.raises(ConfigError, match="agent.max_rounds"):
+        load_config(path)
+
+
+def test_custom_coordinator_rounds(tmp_path: Path) -> None:
+    """协调循环预算可调整，不改变子 Agent 的工具步数。"""
+    path = tmp_path / "config.toml"
+    path.write_text((ROOT / "config.toml").read_text().replace("max_rounds = 8", "max_rounds = 4"))
+    config = load_config(path)
+    assert config.agent.max_rounds == 4
+    assert config.agent.max_steps == 12

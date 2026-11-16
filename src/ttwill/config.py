@@ -68,9 +68,11 @@ class AgentConfig:
 
     Attributes:
         max_steps: 单次派工的最多步数；每个工具调用计一步，无工具回复也计一步。
+        max_rounds: 每条用户消息最多进行的协调决策轮数，每轮至多分派一批任务。
     """
 
     max_steps: int = 12
+    max_rounds: int = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,15 +302,18 @@ def load_config(path: Path) -> AppConfig:
         )
     )
     agent = _table(data.get("agent", {}), "agent")
-    _check_keys(agent, "agent", set(), {"max_steps"})
+    _check_keys(agent, "agent", set(), {"max_steps", "max_rounds"})
     max_steps = agent.get("max_steps", 12)
     if type(max_steps) is not int or max_steps < 1:
         raise ConfigError("agent.max_steps 必须是正整数")
+    max_rounds = agent.get("max_rounds", 8)
+    if type(max_rounds) is not int or max_rounds < 1:
+        raise ConfigError("agent.max_rounds 必须是正整数")
     return AppConfig(
         root=root,
         runs_dir=runs_dir,
         llm=llm_config,
         models=parsed_models,
         backend=backend_config,
-        agent=AgentConfig(max_steps=max_steps),
+        agent=AgentConfig(max_steps=max_steps, max_rounds=max_rounds),
     )

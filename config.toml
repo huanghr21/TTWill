@@ -3,6 +3,8 @@ runs_dir = "runs"
 [agent]
 # 开发默认值；每个工具调用计一步，无工具回复也计一步。
 max_steps = 12
+# 每条用户消息最多进行的协调决策轮数，每轮至多分派一批任务。
+max_rounds = 8
 
 [backend]
 operation_ttl_seconds = 900

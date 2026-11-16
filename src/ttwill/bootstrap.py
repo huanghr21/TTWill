@@ -11,6 +11,7 @@ from ttwill.backend import RetailBackend
 from ttwill.bench.policy import extract_policy
 from ttwill.bench.retail import load_retail_bundle
 from ttwill.config import load_config
+from ttwill.core.coordinator import ConversationState, Coordinator
 from ttwill.core.subagent import DispatchTask, SubAgentRunner
 from ttwill.gateway import CallContext, SessionContext, ToolGateway
 from ttwill.gateway.skills import SkillCatalog
@@ -34,6 +35,150 @@ def load_skills(root: Path) -> SkillCatalog:
     bundle = load_retail_bundle(root / "data" / "source")
     sections, exclusions = extract_policy(bundle.policy)
     return SkillCatalog(root / "skills", sections, exclusions)
+
+
+def _demo_tool_response(name: str, arguments: dict, call_id: str) -> dict:
+    """构造一次只调用一个工具的假模型响应。
+
+    Args:
+        name: 当前脚本步骤调用的工具名称。
+        arguments: 工具参数，按 JSON 编码后交给真实工具循环处理。
+        call_id: 本次调用标识，供消息历史关联工具结果。
+
+    Returns:
+        含固定假模型名称、单个工具调用和演示用量的完整响应。
+    """
+    return {
+        "model": "fake-demo",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 6},
+    }
+
+
+def _coordinator_demo_responses(
+    state: ConversationState, email: str, order_id: str
+) -> Iterator[dict]:
+    """依次生成两轮协调脚本，分派标识取自运行时代码创建的任务。
+
+    Args:
+        state: 当前对话状态；新增任务生效后才读取其稳定标识。
+        email: 固定种子用户的身份验证邮箱。
+        order_id: 要取消的固定种子待发货订单。
+
+    Yields:
+        第一轮验证身份、建立任务、完成计划、分派和回复，第二轮完成计划与
+        回复所需的单工具假模型响应；不生成模型提交调用。
+    """
+    yield _demo_tool_response("find_user_id_by_email", {"email": email}, "identity")
+    yield _demo_tool_response(
+        "update_tasks",
+        {
+            "changes": [
+                {
+                    "operation": "add",
+                    "capability": "order_service",
+                    "action": "cancel_pending_order",
+                    "order_id": order_id,
+                    "instruction": f"取消订单 {order_id}，原因是不再需要，准备后等待用户确认。",
+                }
+            ]
+        },
+        "plan",
+    )
+    yield _demo_tool_response("complete_plan", {}, "complete-plan-1")
+    yield _demo_tool_response("dispatch_tasks", {"task_ids": list(state.tasks.tasks)}, "dispatch")
+    yield _demo_tool_response(
+        "reply", {"message_hint": "已准备取消订单，请核对以下详情后确认。"}, "reply-1"
+    )
+    yield _demo_tool_response("complete_plan", {}, "complete-plan-2")
+    yield _demo_tool_response("reply", {"message_hint": "已核验本次办理结果。"}, "reply-2")
+
+
+async def run_coordinator_demo(config_path: Path) -> dict:
+    """在独立业务库上演示请求、展示、用户确认与代码提交核验的两轮对话。
+
+    Args:
+        config_path: 含 flash 档位与 Agent 循环预算的 TOML 配置路径，种子和
+            Skill 资源均相对于配置所在目录读取。
+
+    Returns:
+        含 turns、database 和 trace 的字典。turns 按顺序保存准备待确认与
+        用户确认后的完整回复和任务快照；正常情况下第二轮写任务为 done。
+
+    Raises:
+        ValueError: 配置、种子、Skill 或模型脚本与运行接口不匹配。
+        LLMError: 假模型响应脚本已耗尽，或响应结构不合格。
+        OSError: 资源无法读取，或业务库、运行记录无法写入。
+    """
+    config = load_config(config_path)
+    bundle = load_retail_bundle(config.root / "data" / "source")
+    skills = load_skills(config.root)
+    order = next(
+        order
+        for order in bundle.database["orders"].values()
+        if order["status"] == "pending" and len(order["payment_history"]) == 1
+    )
+    user = bundle.database["users"][order["user_id"]]
+    order_id = order["order_id"]
+    run_id = f"coordinator-demo-{uuid4().hex}"
+    state = ConversationState(SessionContext(uuid4().hex))
+    trace = Trace(config.runs_dir / run_id, state.session.session_id, run_id=run_id)
+    database = trace.run_dir / "business.sqlite"
+    backend = RetailBackend(database, ttl_seconds=config.backend.operation_ttl_seconds)
+    try:
+        backend.initialize(bundle.database)
+        gateway = ToolGateway(backend, trace, skills)
+        child_calls = [
+            ("get_order_details", {"order_id": order_id}),
+            ("load_skill", {"name": "cancel_pending_order"}),
+            ("cancel_pending_order", {"order_id": order_id, "reason": "no longer needed"}),
+            ("finish", {"missing": [], "message_hint": "取消已准备，请用户核对并确认。"}),
+        ]
+        child_llm = LLMClient(
+            config,
+            trace,
+            FakeModel(
+                _demo_tool_response(name, args, f"child-{index}")
+                for index, (name, args) in enumerate(child_calls)
+            ),
+        )
+        runner = SubAgentRunner(
+            build_registry(skills), gateway, child_llm, max_steps=config.agent.max_steps
+        )
+        coordinator_llm = LLMClient(
+            config,
+            trace,
+            FakeModel(_coordinator_demo_responses(state, user["email"], order_id)),
+        )
+        coordinator = Coordinator(
+            gateway, runner, coordinator_llm, max_rounds=config.agent.max_rounds
+        )
+        with trace.span("session", "协调者两轮假模型演示"):
+            first = await coordinator.handle_turn(
+                state, f"我的邮箱是 {user['email']}，请取消订单 {order_id}，原因是不再需要。"
+            )
+            second = await coordinator.handle_turn(state, "确认")
+        return {"turns": [first, second], "database": str(database), "trace": str(trace.path)}
+    finally:
+        backend.close()
 
 
 async def run_agent_demo(config_path: Path, capability: str) -> dict:

@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ttwill.backend import BusinessError, RetailBackend
-from ttwill.bootstrap import business_runtime, run_agent_demo
+from ttwill.bootstrap import business_runtime, run_agent_demo, run_coordinator_demo
 from ttwill.config import load_config
 from ttwill.gateway import AFTER_SALES_WRITES, READ_TOOLS, WRITE_TOOLS, CallContext
 from ttwill.llm import FakeModel, LLMClient
@@ -183,7 +183,11 @@ def run_business(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
-    """解析命令行参数，并以 JSON 或轨迹树输出结果。"""
+    """解析进程命令行参数，并向标准输出写入 JSON 或轨迹树。
+
+    Raises:
+        SystemExit: 参数或业务运行错误时退出码为 2；参考动作存在差异时为 1。
+    """
     parser = argparse.ArgumentParser(prog="ttwill", description="TTWill 命令行入口")
     subparsers = parser.add_subparsers(dest="command", required=True)
     demo = subparsers.add_parser("demo", help="用假模型验证调用、记录和轨迹树")
@@ -193,6 +197,10 @@ def main() -> None:
     agent_demo.add_argument(
         "--capability", choices=["order_service", "after_sales"], default="order_service"
     )
+    coordinator_demo = subparsers.add_parser(
+        "coordinator-demo", help="用假模型演示请求、确认与核验的两轮对话"
+    )
+    coordinator_demo.add_argument("--config", type=Path, default=Path("config.toml"))
     trace = subparsers.add_parser("trace", help="离线查看会话 JSONL 轨迹树")
     trace.add_argument("path", type=Path, help="会话轨迹文件")
     _business_parser(subparsers)
@@ -209,6 +217,12 @@ def main() -> None:
                     asyncio.run(run_agent_demo(args.config, args.capability)),
                     ensure_ascii=False,
                     indent=2,
+                )
+            )
+        elif args.command == "coordinator-demo":
+            print(
+                json.dumps(
+                    asyncio.run(run_coordinator_demo(args.config)), ensure_ascii=False, indent=2
                 )
             )
         elif args.command == "trace":

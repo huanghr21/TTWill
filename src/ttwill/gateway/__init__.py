@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ttwill.backend import BusinessError, RetailBackend, request_key
 from ttwill.backend.arguments import ARGUMENT_MODELS, validate_arguments
 from ttwill.gateway.skills import SkillCatalog
+from ttwill.gateway.verification import verification_query, verify_business_result
 from ttwill.tracing import Trace
 
 IDENTITY_TOOLS = frozenset({"find_user_id_by_email", "find_user_id_by_name_zip"})
@@ -75,7 +76,7 @@ class CallContext:
 
 
 class ToolGateway:
-    """提供模型业务工具，以及代码专用的提交和拒绝入口。
+    """提供模型业务工具，以及代码专用的提交、拒绝和核验入口。
 
     Attributes:
         backend: 执行业务查询与准备、提交、拒绝操作的后端。
@@ -204,7 +205,8 @@ class ToolGateway:
             context: 本次调用的会话、能力、实例和任务上下文。
             name: 工具名称或代码操作名称。
             args: 调用参数；写入记录时复制，避免后续修改影响轨迹。
-            kind: 调用类别，为 call、commit、reject 或 operation（操作对账）。
+            kind: 调用类别，为 call、commit、reject、operation（操作对账）、
+                verification（核验）或 verification_read（核验中的业务重读）。
 
         Returns:
             包含调用类别、上下文标识、动作名称、参数副本和读写类别的属性字典。
@@ -361,6 +363,84 @@ class ToolGateway:
             BusinessError: 身份尚未验证、操作不存在，或操作不属于当前用户。
         """
         return self._resolve(context, "operation", operation_id, {})
+
+    def verify_operation(self, context: CallContext, operation_id: str) -> dict:
+        """由代码重读已提交操作的业务实体，核验后返回可信结果。
+
+        此方法不注册为模型工具。核验只读取业务数据，不修改任务状态；调用方
+        只有收到 verified 为 True 的结果才可将写任务标为完成。
+
+        Args:
+            context: 包含已验证会话身份的代码调用上下文。
+            operation_id: 需要在提交后立即核验的后端操作 ID。
+
+        Returns:
+            含 operation_id、action、args、verified、expected、actual、reason
+            和 checked_fields 的核验结果；不一致时 verified 为 False。金额检查
+            基于订单商品、收付款明细与换货差额，不包括账户余额。
+
+        Raises:
+            BusinessError: 身份未验证、操作归属不符或不存在、尚未提交、动作
+                没有核验规则，或重读业务实体失败。
+        """
+        attrs = self._attrs(
+            context, "verify_operation", {"operation_id": operation_id}, "verification"
+        )
+        attrs["operation_id"] = operation_id
+        with self.trace.span("verification", "verify_operation", attrs=attrs) as span:
+            try:
+                operation = self.get_operation(context, operation_id)
+                if operation["status"] != "committed":
+                    raise BusinessError("只能核验已提交操作", code="operation_not_committed")
+                query, query_args = verification_query(operation)
+                actual = self._read_for_verification(context, query, query_args)
+                result = verify_business_result(operation, actual)
+            except BusinessError as exc:
+                with self.trace.span("guard", "verification_allowed") as guard:
+                    guard.status = "blocked"
+                    guard.attrs.update(allowed=False, reason=str(exc), error_code=exc.code)
+                span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                self.records.append(deepcopy(span.attrs))
+                raise
+            with self.trace.span("guard", "verification_matches") as guard:
+                guard.attrs.update(allowed=result["verified"], reason=result["reason"])
+                if not result["verified"]:
+                    guard.status = "blocked"
+                    span.status = "blocked"
+            span.attrs.update(
+                action=operation["action"],
+                result=deepcopy(result),
+                status="verified" if result["verified"] else "verification_failed",
+                reason=result["reason"],
+            )
+            self.records.append(deepcopy(span.attrs))
+            return result
+
+    def _read_for_verification(self, context: CallContext, name: str, args: dict) -> dict:
+        """执行代码选择的业务查询，记录核验真正读取的实体。
+
+        Args:
+            context: 已通过核验入口身份检查的代码调用上下文。
+            name: 核验规则选择的订单或用户查询名称。
+            args: 由已校验操作记录构造的查询参数。
+
+        Returns:
+            当前业务库中的订单或用户实体。
+
+        Raises:
+            BusinessError: 业务实体不存在或不属于当前用户。
+        """
+        attrs = self._attrs(context, name, args, "verification_read")
+        with self.trace.span("tool", name, attrs=attrs) as span:
+            try:
+                result = self.backend.query(context.session.user_id, name, args)
+            except BusinessError as exc:
+                span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                self.records.append(deepcopy(span.attrs))
+                raise
+            span.attrs.update(status="executed", result=deepcopy(result))
+            self.records.append(deepcopy(span.attrs))
+            return result
 
     def _resolve(self, context: CallContext, kind: str, operation_id: str, args: dict) -> dict:
         """记录代码提交、拒绝或对账操作的身份检查、参数与执行结果。

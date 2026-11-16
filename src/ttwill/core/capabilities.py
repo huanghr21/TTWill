@@ -61,3 +61,18 @@ class CapabilityRegistry:
         if name not in self._capabilities:
             raise ValueError(f"未知能力：{name}")
         return self._capabilities[name]
+
+    def catalog(self) -> list[dict]:
+        """列出协调者可选择的能力及业务工具。
+
+        Returns:
+            按注册顺序排列的能力名称、职责说明与工具名称，不含实例提示词。
+        """
+        return [
+            {
+                "name": capability.name,
+                "description": capability.description,
+                "tools": sorted(capability.tools - {"load_skill"}),
+            }
+            for capability in self._capabilities.values()
+        ]

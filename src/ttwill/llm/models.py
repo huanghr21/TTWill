@@ -1,5 +1,6 @@
 """兼容 Chat Completions 的传输与可脚本化的假模型。"""
 
+from collections.abc import Iterable
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -89,11 +90,12 @@ class CompatibleModel:
 class FakeModel:
     """按顺序返回响应或抛出错误；脚本耗尽明确失败，不访问网络。"""
 
-    def __init__(self, responses: list[dict[str, Any] | LLMError]) -> None:
+    def __init__(self, responses: Iterable[dict[str, Any] | LLMError]) -> None:
         """保存响应脚本并初始化请求历史。
 
         Args:
-            responses: 按调用顺序消费的响应对象或 LLMError；每次调用消费一项。
+            responses: 按调用顺序消费的响应对象或 LLMError 可迭代对象；每次调用
+                消费一项，支持按当前运行状态延迟生成响应。
         """
         self._responses = iter(responses)
         self.requests: list[dict[str, Any]] = []
