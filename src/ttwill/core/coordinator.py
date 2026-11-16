@@ -3,7 +3,7 @@
 import asyncio
 import json
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -278,7 +278,8 @@ class Coordinator:
                     "content": json.dumps(outcome, ensure_ascii=False),
                 }
             )
-            if work.result is None:
+            # 持久运行时每次编译已注入最新权威快照，不再把同一份状态反复写成用户消息。
+            if work.result is None and messages is None:
                 work.messages.append(
                     {
                         "role": "user",
@@ -403,11 +404,12 @@ class Coordinator:
         for task in state.tasks.tasks.values():
             if task.status not in {"pending_confirm", "needs_verification", "failed"}:
                 continue
+            task_context = replace(context, task_id=task.id, revision=task.revision)
             for operation_id in list(task.operation_ids):
-                operation = self.gateway.get_operation(context, operation_id)
+                operation = self.gateway.get_operation(task_context, operation_id)
                 if task.status == "failed" and operation["status"] != "committed":
                     if operation["status"] == "prepared":
-                        self.gateway.reject(context, operation_id, task.reason or "任务已失败")
+                        self.gateway.reject(task_context, operation_id, task.reason or "任务已失败")
                     continue
                 if operation["status"] == "committed":
                     self._verify(task, context, operation)
@@ -449,7 +451,8 @@ class Coordinator:
                 or shown["turn"] != state.turn - 1
             ):
                 continue
-            operation = self.gateway.get_operation(context, shown["operation_id"])
+            task_context = replace(context, task_id=task.id, revision=task.revision)
+            operation = self.gateway.get_operation(task_context, shown["operation_id"])
             if (
                 operation["status"] == "prepared"
                 and operation["args"] == shown["args"]
@@ -465,17 +468,20 @@ class Coordinator:
             if judgment["operation_id"] not in eligible:
                 continue
             task, shown = eligible[judgment["operation_id"]]
+            task_context = replace(context, task_id=task.id, revision=task.revision)
             entry = dict(judgment)
             try:
                 if judgment["decision"] == "confirm":
                     task.status = "needs_verification"
                     task.reason = "正在提交并核验；结果未知时先对账"
-                    operation = self.gateway.commit(context, shown["operation_id"], shown["args"])
+                    operation = self.gateway.commit(
+                        task_context, shown["operation_id"], shown["args"]
+                    )
                     task.actions.append({"kind": "commit", "result": deepcopy(operation)})
                     entry["verification"] = self._verify(task, context, operation)
                 elif judgment["decision"] in {"reject", "modify"}:
                     operation = self.gateway.reject(
-                        context, shown["operation_id"], judgment["reason"]
+                        task_context, shown["operation_id"], judgment["reason"]
                     )
                     task.actions.append({"kind": "reject", "result": deepcopy(operation)})
                     task.operation_ids = []
@@ -488,12 +494,12 @@ class Coordinator:
                         task.status = "cancelled"
                 entry["status"] = task.status
             except BusinessError as exc:
-                operation = self.gateway.get_operation(context, shown["operation_id"])
+                operation = self.gateway.get_operation(task_context, shown["operation_id"])
                 if operation["status"] == "committed":
                     task.status = "needs_verification"
                 else:
                     if operation["status"] == "prepared":
-                        self.gateway.reject(context, operation["operation_id"], str(exc))
+                        self.gateway.reject(task_context, operation["operation_id"], str(exc))
                     task.status = "failed"
                 task.reason = str(exc)
                 entry.update(status=task.status, error=exc.code, reason=str(exc))
@@ -511,7 +517,8 @@ class Coordinator:
         Returns:
             网关生成的完整核验结果；失败保留已提交事实并记录原因。
         """
-        verification = self.gateway.verify_operation(context, operation["operation_id"])
+        task_context = replace(context, task_id=task.id, revision=task.revision)
+        verification = self.gateway.verify_operation(task_context, operation["operation_id"])
         task.facts.append({"verification": deepcopy(verification)})
         task.status = "done" if verification["verified"] else "failed"
         task.reason = None if verification["verified"] else verification["reason"]
@@ -627,6 +634,7 @@ class Coordinator:
             BusinessError: 对账、清理或核验被后端拒绝。
             OSError: 后端或轨迹读写失败。
         """
+        context = replace(context, task_id=task.id, revision=task.revision)
         task.actions.extend(deepcopy(result["actions"]))
         task.facts.extend(deepcopy(result["facts"]))
         task.missing, task.message_hint = result["missing"], result["message_hint"]
@@ -687,6 +695,7 @@ class Coordinator:
             BusinessError: 操作不存在或身份归属不符。
             OSError: 清理仍无法读写；下一轮按保存的引用继续对账。
         """
+        context = replace(context, task_id=task.id, revision=task.revision)
         for operation_id in task.operation_ids:
             operation = self.gateway.get_operation(context, operation_id)
             if operation["status"] == "prepared":
@@ -756,10 +765,11 @@ class Coordinator:
         self._guard("coordinator_limit", reason)
         for task_id in self._actionable(state):
             task = state.tasks.tasks[task_id]
+            task_context = replace(context, task_id=task.id, revision=task.revision)
             for operation_id in task.operation_ids:
-                operation = self.gateway.get_operation(context, operation_id)
+                operation = self.gateway.get_operation(task_context, operation_id)
                 if operation["status"] == "prepared":
-                    self.gateway.reject(context, operation_id, reason)
+                    self.gateway.reject(task_context, operation_id, reason)
                 elif operation["status"] == "committed":
                     self._verify(task, context, operation)
             if task.status != "done":
@@ -829,7 +839,8 @@ class Coordinator:
             ):
                 continue
             for operation_id in task.operation_ids:
-                operation = self.gateway.get_operation(context, operation_id)
+                task_context = replace(context, task_id=task.id, revision=task.revision)
+                operation = self.gateway.get_operation(task_context, operation_id)
                 if operation["status"] != "prepared":
                     continue
                 content = operation_content(operation)

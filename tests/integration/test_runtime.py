@@ -235,6 +235,78 @@ def test_same_session_waits_and_commits_only_after_next_message(runtime_factory,
     asyncio.run(scenario())
 
 
+def test_each_decision_uses_one_current_snapshot_and_archives_complete_dialogue(runtime_factory):
+    """持久运行每次只注入最新权威快照，档案保留真实原话和完整工具往返。"""
+
+    def script(ids):
+        """先准备取消，再在下一轮确认，覆盖任务从新增到核验完成的变化。"""
+        yield from prepare_script(ids)
+        yield from followup_script(ids)
+
+    async def scenario():
+        """检查六次协调输入中的状态新鲜度及两轮完整归档。"""
+        async with runtime_factory("chat1", script, child_script()) as bundle:
+            runtime, _, _, fake, _, archive = bundle
+            await open_u1(runtime)
+            prepared = await runtime.send_message("请取消订单 #1")
+            completed = await runtime.send_message("确认")
+            statuses = []
+            for request in fake.requests:
+                snapshots = [
+                    message["content"]
+                    for message in request["messages"]
+                    if message["role"] == "system"
+                    and message.get("content", "").startswith(STATE_NOTICE)
+                ]
+                assert len(snapshots) == 1
+                snapshot = json.loads(snapshots[0].removeprefix(STATE_NOTICE))
+                assert snapshot["verified"] is True
+                statuses.append([task["status"] for task in snapshot["tasks"]])
+                assert all(
+                    message["content"] in {"请取消订单 #1", "确认"}
+                    for message in request["messages"]
+                    if message["role"] == "user"
+                )
+            assert statuses == [
+                [],
+                ["pending"],
+                ["pending"],
+                ["pending_confirm"],
+                ["pending_confirm"],
+                ["done"],
+            ]
+            messages = [entry["payload"] for entry in archive.messages("thread", "u1")]
+            assert [message["content"] for message in messages if message["role"] == "user"] == [
+                "请取消订单 #1",
+                "确认",
+            ]
+            calls = []
+            for index, message in enumerate(messages):
+                if message.get("tool_calls"):
+                    assert len(message["tool_calls"]) == 1
+                    call = message["tool_calls"][0]
+                    calls.append(call["function"]["name"])
+                    result = messages[index + 1]
+                    assert result["role"] == "tool" and result["tool_call_id"] == call["id"]
+                    assert isinstance(json.loads(result["content"]), (dict, list))
+            assert calls == [
+                "update_tasks",
+                "complete_plan",
+                "dispatch_tasks",
+                "reply",
+                "complete_plan",
+                "reply",
+            ]
+            assert len([message for message in messages if message["role"] == "tool"]) == len(calls)
+            assert [
+                message["content"]
+                for message in messages
+                if message["role"] == "assistant" and not message.get("tool_calls")
+            ] == [prepared["reply"], completed["reply"]]
+
+    asyncio.run(scenario())
+
+
 def test_reopened_session_reauthenticates_and_redisplays_before_confirmation(
     runtime_factory, backend
 ):

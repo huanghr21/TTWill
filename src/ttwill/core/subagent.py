@@ -139,6 +139,7 @@ class SubAgentRunner:
             "user_id": session.user_id,
             "capability": capability.name,
             "instance_id": context.instance_id,
+            "instruction": task.instruction,
         }
         completed = False
         exit_reason = "子 Agent 异常退出，作废尚未提交的操作"
