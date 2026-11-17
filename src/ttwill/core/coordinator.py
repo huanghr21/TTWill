@@ -16,6 +16,8 @@ from ttwill.gateway.presentation import action_label, operation_content
 from ttwill.llm import LLMClient
 from ttwill.llm.types import LLMError
 
+STOP_NOTICE = "抱歉，这次处理没有完成，请稍后重试或说明是否需要转人工。"
+
 
 class UpdateTasks(BaseModel):
     """只接受任务增、改、撤提议，不接受业务完成或用户授权字段。"""
@@ -206,6 +208,19 @@ class Coordinator:
             self.stop_turn(state, work, f"协调模型调用失败：{type(exc).__name__}")
             return
         calls = response.message.get("tool_calls") or []
+        text = (response.message.get("content") or "").strip()
+        if not calls and text and self._can_reply(state, work):
+            # 模型常以纯文本回复用户；仅在 reply 工具同样会被接受时按 reply 处理。
+            if state.session.user_id is not None:
+                self._reconcile(state, context)
+            if state.session.user_id is None or not self._actionable(state):
+                work.messages.append(deepcopy(response.message))
+                work.result = self._reply(
+                    state, context, Reply(message_hint=text), work.decisions, work.rounds
+                )
+                if response.message["content"] == work.result["reply"]:
+                    state.history[-1] = deepcopy(response.message)
+                return
         if len(calls) != 1:
             work.invalid_outputs.append(deepcopy(response.message))
             self._guard(
@@ -233,6 +248,7 @@ class Coordinator:
                             self.runner.registry.get(change.capability)
                     outcome = state.tasks.apply(updates.changes, self.gateway, context)
                 elif name == "complete_plan":
+                    self._require_identity(state)
                     CompletePlan.model_validate(arguments)
                     if work.confirmed:
                         raise ValueError("本轮已经判定过用户确认")
@@ -252,7 +268,7 @@ class Coordinator:
                     outcome = await self._dispatch(state, context, selection.task_ids)
                 elif name == "reply":
                     proposal = Reply.model_validate(arguments)
-                    if not work.confirmed:
+                    if not self._can_reply(state, work):
                         raise ValueError("先提出所有任务修改并调用 complete_plan，再回复")
                     self._reconcile(state, context)
                     unfinished = self._actionable(state)
@@ -306,7 +322,12 @@ class Coordinator:
         context = CallContext(state.session, "coordinator", work.instance_id)
         self._fail_unfinished(state, context, reason)
         work.result = self._reply(
-            state, context, Reply(message_hint=""), work.decisions, work.rounds, notice=reason
+            state,
+            context,
+            Reply(message_hint=""),
+            work.decisions,
+            work.rounds,
+            notice=STOP_NOTICE,
         )
 
     def _messages(self, state: ConversationState) -> list[dict]:
@@ -320,7 +341,7 @@ class Coordinator:
         """
         prompt = (
             "你是电商客服协调者，负责理解全部诉求并维护任务。每次调用一个工具。"
-            "未验证身份时先查找用户；用户只能服务一个账户。"
+            "未验证身份时先查找用户，缺少邮箱或姓名+邮编时直接用 reply 询问；用户只能服务一个账户。"
             "首先用 update_tasks 提出本轮所有新增、修改、撤销，再用 complete_plan 结束计划。"
             "用户改口时必须在 complete_plan 之前更新旧任务，不能只据‘可以’提交。"
             "此后用 dispatch_tasks 选择任务，或用 update_tasks 撤销已不需要的条件备用任务。"
@@ -362,7 +383,10 @@ class Coordinator:
         Returns:
             当前可见的函数工具定义。
         """
-        models = {"reply": Reply} if confirmed else {"complete_plan": CompletePlan}
+        if context.session.user_id is None:
+            models = {"reply": Reply}
+        else:
+            models = {"reply": Reply} if confirmed else {"complete_plan": CompletePlan}
         if context.session.user_id is not None:
             models["update_tasks"] = UpdateTasks
             if confirmed:
@@ -378,6 +402,11 @@ class Coordinator:
             }
             for name, model in models.items()
         ]
+
+    @staticmethod
+    def _can_reply(state: ConversationState, work: TurnState) -> bool:
+        """身份验证前没有任务可推进，可直接回复；验证后须先完成本轮计划与确认判定。"""
+        return state.session.user_id is None or work.confirmed
 
     @staticmethod
     def _require_identity(state: ConversationState) -> None:
@@ -420,6 +449,7 @@ class Coordinator:
                     task.revision += 1
                     task.status = "conditional" if task.condition else "pending"
                     task.reason = f"旧操作已失效：{operation['status']}，需重新准备与展示"
+                    task.reason_internal = False
 
     async def _confirm(
         self,
@@ -474,6 +504,7 @@ class Coordinator:
                 if judgment["decision"] == "confirm":
                     task.status = "needs_verification"
                     task.reason = "正在提交并核验；结果未知时先对账"
+                    task.reason_internal = False
                     operation = self.gateway.commit(
                         task_context, shown["operation_id"], shown["args"]
                     )
@@ -486,6 +517,7 @@ class Coordinator:
                     task.actions.append({"kind": "reject", "result": deepcopy(operation)})
                     task.operation_ids = []
                     task.reason = judgment["reason"]
+                    task.reason_internal = False
                     if judgment["decision"] == "modify":
                         task.revision += 1
                         task.status = "waiting_info"
@@ -502,6 +534,7 @@ class Coordinator:
                         self.gateway.reject(task_context, operation["operation_id"], str(exc))
                     task.status = "failed"
                 task.reason = str(exc)
+                task.reason_internal = False
                 entry.update(status=task.status, error=exc.code, reason=str(exc))
             results.append(entry)
         return results
@@ -522,6 +555,7 @@ class Coordinator:
         task.facts.append({"verification": deepcopy(verification)})
         task.status = "done" if verification["verified"] else "failed"
         task.reason = None if verification["verified"] else verification["reason"]
+        task.reason_internal = False
         return verification
 
     async def _dispatch(
@@ -580,6 +614,7 @@ class Coordinator:
             for task in selected:
                 if task.status == "running":
                     task.status, task.reason = "failed", f"分派中断：{type(exc).__name__}"
+                    task.reason_internal = True
                     self._interrupted_records(state, task)
             raise
         return {"dispatched": [task.to_dict() for task in selected], "blocked": blocked}
@@ -604,7 +639,8 @@ class Coordinator:
                 task.capability,
                 DispatchTask(
                     task.id,
-                    f"{task.instruction}\n本次任务动作：{task.action}；目标订单：{task.order_id}。只准备这一项完整请求。",
+                    f"{task.instruction}\n本次任务动作：{task.action}；目标订单：{task.order_id}。只准备这一项完整请求。"
+                    f"\n用户身份已由协调者验证为 {state.session.user_id}，不要再要求用户验证身份。",
                     task.revision,
                     task.is_write,
                     deepcopy(task.facts),
@@ -613,11 +649,13 @@ class Coordinator:
             self._merge_result(context, task, result)
         except (LLMError, TimeoutError, ValueError) as exc:
             task.status, task.reason = "failed", f"子 Agent 调用失败：{type(exc).__name__}"
+            task.reason_internal = True
             self._interrupted_records(state, task)
             self._discard_prepared(context, task)
             return
         except (asyncio.CancelledError, OSError) as exc:
             task.status, task.reason = "failed", f"子 Agent 中断：{type(exc).__name__}"
+            task.reason_internal = True
             self._interrupted_records(state, task)
             self._discard_prepared(context, task)
             raise
@@ -658,10 +696,12 @@ class Coordinator:
                         context, operation["operation_id"], "子 Agent 操作与分派任务不一致"
                     )
             task.status, task.reason = "failed", "子 Agent 操作与分派任务不一致"
+            task.reason_internal = True
             self._guard("dispatch_result", task.reason)
             return
         task.operation_ids = operation_ids
         task.reason = result["reason"]
+        task.reason_internal = task.reason is not None
         task.status = {
             "need_confirm": "pending_confirm",
             "need_info": "waiting_info",
@@ -669,6 +709,7 @@ class Coordinator:
         }.get(result["status"], result["status"])
         if task.is_write and task.status == "done":
             task.status, task.reason = "failed", "写任务必须提交后核验"
+            task.reason_internal = True
         if (
             not task.is_write
             and task.status == "done"
@@ -679,6 +720,7 @@ class Coordinator:
             )
         ):
             task.status, task.reason = "failed", "未取得当前任务动作与目标对应的查询事实"
+            task.reason_internal = True
             self._guard("dispatch_read_result", task.reason)
         for operation in operations:
             if operation["status"] == "committed":
@@ -774,6 +816,7 @@ class Coordinator:
                     self._verify(task, context, operation)
             if task.status != "done":
                 task.status, task.reason = "failed", reason
+                task.reason_internal = True
 
     def _reply(
         self,
@@ -793,7 +836,7 @@ class Coordinator:
             proposal: 模型要点和希望展示的任务 ID，不含可信业务字段。
             decisions: 本轮逐操作确认与执行结果。
             rounds: 本轮已经使用的协调决策轮数。
-            notice: 代码产生的本轮异常说明；None 表示无需附加通知。
+            notice: 面向用户的本轮异常说明；None 表示无需附加通知。
 
         Returns:
             回复、任务快照、实际展示项、确认结果与轮数。
@@ -827,7 +870,10 @@ class Coordinator:
             if task.missing:
                 lines.append("需要补充：" + "；".join(task.missing))
             if task.reason:
-                lines.append(task.reason)
+                if not task.reason_internal:
+                    lines.append(task.reason)
+                elif STOP_NOTICE not in lines:
+                    lines.append(STOP_NOTICE)
             if task.status == "done" and not task.is_write:
                 lines.extend(
                     json.dumps(fact["result"], ensure_ascii=False)

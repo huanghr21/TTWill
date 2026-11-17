@@ -12,12 +12,18 @@ from ttwill.agents import build_registry
 from ttwill.backend import RetailBackend, request_key
 from ttwill.backend.store import events, operations
 from ttwill.config import AppConfig, LLMConfig, ModelConfig
-from ttwill.core.context import STATE_NOTICE, SUMMARY_NOTICE, ContextCompiler, context_chars
-from ttwill.core.coordinator import Coordinator
+from ttwill.core.context import (
+    STATE_NOTICE,
+    SUMMARY_NOTICE,
+    ContextBudgetExceeded,
+    ContextCompiler,
+    context_chars,
+)
+from ttwill.core.coordinator import STOP_NOTICE, Coordinator
 from ttwill.core.runtime import PersistentRuntime
 from ttwill.core.subagent import SubAgentRunner
 from ttwill.gateway import BusinessError, ToolGateway
-from ttwill.llm import FakeModel, LLMClient
+from ttwill.llm import FakeModel, LLMClient, LLMError
 from ttwill.persistence import Archive
 from ttwill.tracing import Trace
 
@@ -114,7 +120,7 @@ def child_script() -> list[dict]:
 
 
 def text_response(content: str) -> dict:
-    """将摘要或独立确认判定正文包装为纯文本假模型响应。"""
+    """将客服回复、摘要或独立确认判定正文包装为纯文本假模型响应。"""
     return {
         "model": "fake",
         "choices": [
@@ -192,6 +198,107 @@ def runtime_factory(tmp_path, backend, skill_catalog):
                 yield runtime, coordinator, gateway, fake, child_fake, archive
 
     return make
+
+
+@pytest.mark.parametrize("cause", ["round_limit", "model_error", "context_budget"])
+def test_internal_stop_reason_survives_checkpoint_without_leaking(
+    runtime_factory, monkeypatch, cause
+):
+    """轮数、模型和上下文停止原因经真实检查点恢复后仍留存，但不进入用户回复。"""
+
+    def script(ids):
+        """创建任务后在下一次决策前后触发指定的内部停止。"""
+        yield next(prepare_script(ids))
+        if cause == "model_error":
+            yield LLMError("模型服务暂时不可用")
+
+    async def scenario():
+        """关闭并重开 SQLite 检查点，验证内部标记及可见回复的生命周期。"""
+        async with runtime_factory("stopped", script) as bundle:
+            runtime, coordinator, gateway = bundle[:3]
+            await open_u1(runtime)
+            if cause == "round_limit":
+                coordinator.max_rounds = 1
+            elif cause == "context_budget":
+                compile_context = runtime.compiler.compile
+
+                async def fail_after_task_creation(**kwargs):
+                    """只在真实任务已写入上一节点检查点后模拟必要上下文无法容纳。"""
+                    if kwargs["task_snapshot"]["tasks"]:
+                        raise ContextBudgetExceeded("必要任务快照超过上下文预算")
+                    return await compile_context(**kwargs)
+
+                monkeypatch.setattr(runtime.compiler, "compile", fail_after_task_creation)
+            first = await runtime.send_message("请取消订单 #1")
+            task = first["tasks"][0]
+            assert task["status"] == "failed" and task["reason_internal"] is True
+            assert STOP_NOTICE in first["reply"] and task["reason"] not in first["reply"]
+            events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+            assert any(
+                event["kind"] == "guard" and event["attrs"].get("reason") == task["reason"]
+                for event in events
+            )
+        async with runtime_factory("resumed", followup_script) as bundle:
+            runtime = bundle[0]
+            opened = await open_u1(runtime)
+            assert opened["tasks"][0]["reason"] == task["reason"]
+            assert opened["tasks"][0]["reason_internal"] is True
+            result = await runtime.send_message("请告诉我处理情况")
+            assert result["tasks"][0]["reason"] == task["reason"]
+            assert STOP_NOTICE in result["reply"] and task["reason"] not in result["reply"]
+            assert result["displayed"] == [] and result["confirmation_results"] == []
+
+    asyncio.run(scenario())
+
+
+def test_natural_plain_text_reply_keeps_reasoning_and_is_archived_once(runtime_factory):
+    """自然身份询问保留思考消息并只归档一次，认证接管后下一请求仍保留原消息。"""
+    question = "请提供您的邮箱，或姓名和邮编，以便验证身份。"
+    raw = text_response(question)
+    raw["choices"][0]["message"]["reasoning_content"] = "用户尚未提供身份，应先询问。"
+    verified_reply = text_response("请告诉我希望查询哪笔订单。")
+    verified_reply["choices"][0]["message"]["reasoning_content"] = "身份已验证，待用户说明订单。"
+
+    def script(ids):
+        """先直接询问身份，再通过真实查找进入已验证的正常回复。"""
+        yield raw
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("complete_plan", {})
+        yield verified_reply
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "可以，请告诉我订单编号。"})
+
+    async def scenario():
+        """检查认证前请求、认证后档案以及后续模型输入均不重复或丢失回复。"""
+        async with runtime_factory("plain_intake", script) as bundle:
+            runtime, _, gateway, fake, _, archive = bundle
+            first = await runtime.receive_message("我想换货")
+            assert first["rounds"] == 1 and first["reply"] == question
+            assert archive.entries("thread", "u1") == []
+            second = await runtime.receive_message("我的邮箱是 u1@example.com")
+            assert second["rounds"] == 3
+            original = raw["choices"][0]["message"]
+            for request in fake.requests[1:]:
+                matching = [
+                    message for message in request["messages"] if message.get("content") == question
+                ]
+                assert matching == [original]
+            await runtime.receive_message("我先找一下订单编号")
+            for request in fake.requests[-2:]:
+                assert request["messages"].count(verified_reply["choices"][0]["message"]) == 1
+            messages = [entry["payload"] for entry in archive.messages("thread", "u1")]
+            assert [message for message in messages if message.get("content") == question] == [
+                original
+            ]
+            assert sum(message.get("content") == second["reply"] for message in messages) == 1
+            assert verified_reply["choices"][0]["message"] in messages
+            records = [
+                json.loads(path.read_text())
+                for path in (gateway.trace.run_dir / "models").glob("*.json")
+            ]
+            assert any(record["response"] == raw for record in records)
+
+    asyncio.run(scenario())
 
 
 async def open_u1(runtime: PersistentRuntime) -> dict:
@@ -925,8 +1032,15 @@ def test_natural_intake_preserves_round_budget_across_identity(runtime_factory):
             coordinator.max_rounds = 1
             result = await runtime.receive_message("我的邮箱是 u1@example.com，请取消订单 #1")
             assert result["rounds"] == 1
-            assert "达到本轮上限 1" in result["reply"]
+            assert "转人工" in result["reply"] and "上限" not in result["reply"]
             assert result["tasks"] == [] and len(fake.requests) == 1
+            events = [
+                json.loads(line) for line in coordinator.gateway.trace.path.read_text().splitlines()
+            ]
+            assert any(
+                event["kind"] == "guard" and "达到本轮上限 1" in event["attrs"].get("reason", "")
+                for event in events
+            )
             assert (await runtime.snapshot()).session.user_id == "u1"
             saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
             assert saved.next == ("wait",)

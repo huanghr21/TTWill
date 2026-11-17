@@ -95,6 +95,7 @@ def _restore_task(
             operation = gateway.reject(context, operation["operation_id"], reason)
             _record_operation(task, operation)
         task.status, task.reason = "failed", reason
+        task.reason_internal = True
         return
 
     if operation["status"] == "committed":
@@ -105,6 +106,7 @@ def _restore_task(
             task.facts.append(deepcopy(fact))
         task.status = "done" if verification["verified"] else "failed"
         task.reason = verification["reason"]
+        task.reason_internal = False
         task.missing = []
     elif task.status in {"cancelled", "failed"}:
         if operation["status"] == "prepared":
@@ -115,12 +117,14 @@ def _restore_task(
     elif operation["status"] == "prepared":
         task.status = "pending_confirm"
         task.reason = None
+        task.reason_internal = False
         task.missing = []
     else:
         task.operation_ids = []
         task.revision += 1
         task.status = "conditional" if task.condition else "pending"
         task.reason = f"旧操作已失效：{operation['status']}，需重新准备与展示"
+        task.reason_internal = False
 
 
 def _record_operation(task: Task, operation: dict) -> None:

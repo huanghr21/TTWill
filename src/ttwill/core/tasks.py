@@ -36,6 +36,7 @@ class Task:
         operation_ids: 当前修订关联的后端操作标识。
         message_hint: 模型提供的回复要点，不作为执行证据。
         reason: 撤销或失败原因；正常待办时为 None。
+        reason_internal: 原因是否只用于任务状态与轨迹，由代码设置并随检查点保存。
     """
 
     id: str
@@ -52,6 +53,7 @@ class Task:
     operation_ids: list[str] = field(default_factory=list)
     message_hint: str = ""
     reason: str | None = None
+    reason_internal: bool = False
 
     @property
     def is_write(self) -> bool:
@@ -317,6 +319,7 @@ class TaskStore:
         task.revision += 1
         task.operation_ids = []
         task.message_hint = ""
+        task.reason_internal = False
         if change.operation == "cancel":
             task.status = "cancelled"
             task.reason = change.reason

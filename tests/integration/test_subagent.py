@@ -262,6 +262,44 @@ def test_plain_json_finish_and_read_result_are_supported(runtime):
     assert result["facts"][0]["result"]["order_id"] == "#1"
 
 
+def test_thinking_messages_survive_tool_loop_and_invalid_text(runtime):
+    """工具循环和无工具的格式修正均回传完整思考字段，原始响应仍可追溯。"""
+    script = [
+        response(("get_order_details", {"order_id": "#1"})),
+        response(("get_order_details", {"order_id": "#2"})),
+        response(content="订单信息已查到。"),
+        finish(hint="两笔订单已查询。"),
+    ]
+    for index, item in enumerate(script):
+        message = item["choices"][0]["message"]
+        message["reasoning_content"] = f"测试思考标记 {index}"
+        if message.get("tool_calls"):
+            message["tool_calls"][0]["id"] = f"thinking-call-{index}"
+    runner, fake, gateway = runtime(script)
+
+    result = run_task(runner, task=DispatchTask("read", "查询两笔订单"))
+
+    assert result["status"] == "ready"
+    assert result["steps"] == len(fake.requests) == 4
+    for index, request in enumerate(fake.requests):
+        assert [message for message in request["messages"] if message["role"] == "assistant"] == [
+            item["choices"][0]["message"] for item in script[:index]
+        ]
+    assert [
+        message["tool_call_id"]
+        for message in fake.requests[-1]["messages"]
+        if message["role"] == "tool"
+    ] == ["thinking-call-0", "thinking-call-1"]
+    assert any(event["name"] == "invalid_finish" for event in trace_events(gateway.trace.path))
+    usage = trace_events(gateway.trace.run_dir / "usage.jsonl")
+    records = [
+        json.loads((gateway.trace.run_dir / row["record_ref"]).read_text(encoding="utf-8"))
+        for row in usage
+    ]
+    assert [record["response"] for record in records] == script
+    assert records[-1]["request"] == fake.requests[-1]
+
+
 def test_write_without_skill_is_rejected_and_can_be_retried_after_loading(runtime, backend):
     """未加载政策的写调用被网关拦截，加载后同实例才可准备操作。"""
     steps = cancel_steps()

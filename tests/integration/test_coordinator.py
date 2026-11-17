@@ -9,8 +9,9 @@ from sqlalchemy import select, update
 from ttwill.agents import build_registry
 from ttwill.backend.store import orders
 from ttwill.config import AppConfig, LLMConfig, ModelConfig
-from ttwill.core.coordinator import ConversationState, Coordinator
+from ttwill.core.coordinator import STOP_NOTICE, ConversationState, Coordinator
 from ttwill.core.subagent import SubAgentRunner
+from ttwill.core.tasks import Task
 from ttwill.gateway import SessionContext, ToolGateway
 from ttwill.llm import FakeModel, LLMClient, LLMError
 from ttwill.tracing import Trace
@@ -78,6 +79,19 @@ def add_task(action: str, order_id: str, instruction: str, **fields) -> dict:
         "order_id": order_id,
         "instruction": instruction,
         **fields,
+    }
+
+
+def text_response(content: str) -> dict:
+    """将模型直接回复的客服文本包装为兼容接口响应。"""
+    return {
+        "model": "fake",
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content},
+            }
+        ],
     }
 
 
@@ -319,6 +333,8 @@ def test_multiple_orders_require_explicit_scope_and_report_partial_commit_failur
     tasks = by_order(confirmed)
     assert tasks["#1"]["status"] == "done"
     assert tasks["#4"]["status"] == "failed"
+    assert tasks["#4"]["reason_internal"] is False
+    assert tasks["#4"]["reason"] in confirmed["reply"]
     assert len(confirmed["confirmation_results"]) == 2
     assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
     assert backend.export_snapshot()["orders"]["#4"]["status"] == "delivered"
@@ -698,7 +714,8 @@ def test_round_limit_explains_stop_and_keeps_prepared_operation_for_confirmation
     first = turn(coordinator, state, "取消 #1")
     assert first["rounds"] == 4
     assert first["tasks"][0]["status"] == "pending_confirm"
-    assert "上限" in first["reply"]
+    assert "上限" not in first["reply"]
+    assert "转人工" in first["reply"]
     assert len(first["displayed"]) == 1
     operation_id = first["tasks"][0]["operation_ids"][0]
     assert backend.get_operation("u1", operation_id=operation_id)["status"] == "prepared"
@@ -727,3 +744,225 @@ def test_cancellation_before_subagent_start_does_not_leave_selected_task_running
     assert task.reason
     assert task.operation_ids == []
     assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+
+
+@pytest.mark.parametrize("plain_text", [True, False])
+def test_unverified_identity_request_replies_in_one_round(runtime, plain_text):
+    """真实运行中的身份询问可直接回复，纯文本和 reply 工具都不触发格式拒绝。"""
+    message = "您好，我可以帮您办理换货。请先提供您的邮箱，或姓名和邮编，以便验证身份。"
+
+    def script(state):
+        """复现首轮未提供身份时模型生成的合理询问。"""
+        yield text_response(message) if plain_text else tool("reply", {"message_hint": message})
+
+    coordinator, state, gateway, fake, child = runtime(script, [])
+    result = turn(coordinator, state, "我想换一下收到的商品")
+    assert result["reply"] == message
+    assert result["rounds"] == 1 and result["tasks"] == []
+    assert len(fake.requests) == 1 and child.requests == []
+    tools = {item["function"]["name"] for item in fake.requests[0]["tools"]}
+    assert "reply" in tools and "complete_plan" not in tools
+    assert state.session.user_id is None and gateway.records == []
+    events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+    assert not any(event["kind"] == "guard" for event in events)
+
+
+def test_unverified_complete_plan_cannot_authorize_later_dispatch(runtime):
+    """缺少身份时即使模型伪造 complete_plan，也不能提前完成确认阶段。"""
+
+    def script(state):
+        """伪造计划结束后再验证身份，直接分派仍须被原有顺序护栏拒绝。"""
+        yield tool("complete_plan", {})
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
+        yield tool("complete_plan", {})
+        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
+        yield reply()
+
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #1")
+    assert result["tasks"][0]["status"] == "pending_confirm"
+    assert len(child.requests) == 3
+    reasons = [
+        event["attrs"].get("reason", "")
+        for event in map(json.loads, gateway.trace.path.read_text().splitlines())
+        if event["kind"] == "guard"
+    ]
+    assert "请先验证用户身份" in reasons
+    assert "先提出所有任务修改并调用 complete_plan，再分派" in reasons
+
+
+def test_verified_plain_text_requires_complete_plan(runtime):
+    """已验证后直接输出文本仍被拒绝，完成计划后才能按同一回复路径返回。"""
+    message = "请告诉我您需要办理的业务。"
+
+    def script(state):
+        """先违反计划顺序，再按原有协议结束计划并返回相同客服文本。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield text_response(message)
+        yield tool("complete_plan", {})
+        yield text_response(message)
+
+    coordinator, state, gateway, fake, _ = runtime(script, [])
+    result = turn(coordinator, state, "我的邮箱是 u1@example.com")
+    assert result["reply"] == message and result["rounds"] == 4
+    assert len(fake.requests) == 4 and result["tasks"] == []
+    events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+    assert (
+        sum(event["name"] == "coordinator_format" and event["event"] == "end" for event in events)
+        == 1
+    )
+
+
+@pytest.mark.parametrize("plain_text", [True, False])
+def test_actionable_task_cannot_reply_early_and_internal_reason_stays_hidden(runtime, plain_text):
+    """纯文本和工具都不能跳过待办任务，超限原因在下一轮仍只保留于状态和轨迹。"""
+
+    def script(state):
+        """首轮不分派使任务超限，下一轮只读取其失败状态。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("complete_plan", {})
+        yield text_response("已经办理完成。") if plain_text else reply()
+        yield tool("complete_plan", {})
+        yield reply()
+
+    coordinator, state, gateway, _, child = runtime(script, [], max_rounds=4)
+    first = turn(coordinator, state, "请取消 #1")
+    task = first["tasks"][0]
+    assert task["status"] == "failed" and task["reason_internal"] is True
+    assert "达到本轮上限 4" in task["reason"]
+    second = turn(coordinator, state, "请告诉我办理情况")
+    assert second["tasks"][0]["reason"] == task["reason"]
+    assert child.requests == []
+    for result in (first, second):
+        assert STOP_NOTICE in result["reply"]
+        assert task["reason"] not in result["reply"]
+        assert "已经办理完成" not in result["reply"]
+    events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+    assert any(event["attrs"].get("reason") == task["reason"] for event in events)
+
+
+def test_dispatched_query_receives_verified_identity(runtime):
+    """查询子 Agent 收到协调者已验证的用户标识，直接查询后由代码生成真实结果。"""
+
+    def script(state):
+        """验证身份后分派一项读取订单的任务。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [add_task("get_order_details", "#1", "查询订单")]})
+        yield tool("complete_plan", {})
+        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
+        yield reply()
+
+    coordinator, state, _, _, child = runtime(
+        script,
+        [
+            tool("get_order_details", {"order_id": "#1"}),
+            tool("finish", {"missing": [], "message_hint": "已查询订单"}),
+        ],
+    )
+    result = turn(coordinator, state, "邮箱 u1@example.com，帮我查询订单 #1")
+    instruction = json.loads(child.requests[0]["messages"][1]["content"])["instruction"]
+    assert "用户身份已由协调者验证为 u1，不要再要求用户验证身份" in instruction
+    assert result["tasks"][0]["status"] == "done"
+    assert result["tasks"][0]["missing"] == []
+
+
+@pytest.mark.parametrize("operation", ["update", "cancel"])
+def test_task_change_clears_internal_reason_visibility(runtime, operation):
+    """失败任务修改或撤销后清除旧内部标记，新的业务说明正常可见。"""
+
+    def script(state):
+        """先使待办超限，后续按用户改口更新或撤销同一任务。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        task_id = task_ids(state)[0]
+        change = {"operation": operation, "task_id": task_id}
+        if operation == "cancel":
+            change["reason"] = "用户决定保留订单"
+        else:
+            change.update({**cancel_task("#1"), "operation": "update", "task_id": task_id})
+        yield tool("update_tasks", {"changes": [change]})
+        yield tool("complete_plan", {})
+        if operation == "update":
+            yield tool("dispatch_tasks", {"task_ids": [task_id]})
+        yield reply()
+
+    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1"), max_rounds=2)
+    first = turn(coordinator, state, "取消订单 #1")
+    assert first["tasks"][0]["reason_internal"] is True
+    coordinator.max_rounds = 4
+    second = turn(
+        coordinator, state, "按刚才说的重新办理" if operation == "update" else "先保留订单"
+    )
+    assert second["tasks"][0]["reason_internal"] is False
+    assert STOP_NOTICE not in second["reply"]
+    if operation == "cancel":
+        assert "用户决定保留订单" in second["reply"]
+    else:
+        assert second["tasks"][0]["reason"] is None
+        assert len(second["displayed"]) == 1
+
+
+def test_model_cannot_write_internal_reason_flag(runtime):
+    """任务原因可见性属于代码，模型增改提议不能伪造这个字段。"""
+
+    def script(state):
+        """向合法新增任务混入代码字段，随后按空任务正常结束。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [{**cancel_task("#1"), "reason_internal": False}]})
+        yield tool("complete_plan", {})
+        yield reply()
+
+    coordinator, state, gateway, _, _ = runtime(script, [])
+    result = turn(coordinator, state, "请取消 #1")
+    assert result["tasks"] == []
+    events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+    assert any(
+        event["name"] == "coordinator_tool"
+        and "reason_internal" in event["attrs"].get("reason", "")
+        for event in events
+    )
+
+
+def test_older_task_snapshot_defaults_to_visible_business_reason():
+    """旧检查点未保存原因可见性字段时，仍能还原任务及原有业务说明。"""
+    task = Task(
+        **{
+            "id": "old-task",
+            "capability": "order_service",
+            "action": "cancel_pending_order",
+            "instruction": "取消订单 #1",
+            "order_id": "#1",
+            "status": "failed",
+            "reason": "订单已发货，不能取消",
+        }
+    )
+    assert task.reason_internal is False
+    assert task.reason == "订单已发货，不能取消"
+
+
+def test_coordinator_replays_tool_reasoning_and_preserves_raw_record(runtime):
+    """思考模式工具响应连同工具结果回传，原始响应也完整保存在模型记录中。"""
+    raw = tool("find_user_id_by_email", {"email": "u1@example.com"})
+    raw["choices"][0]["message"]["reasoning_content"] = "已收到邮箱，先查询并验证身份。"
+
+    def script(state):
+        """用带思考字段的身份调用进入已验证回复流程。"""
+        yield raw
+        yield tool("complete_plan", {})
+        yield reply()
+
+    coordinator, state, gateway, fake, _ = runtime(script, [])
+    turn(coordinator, state, "邮箱 u1@example.com")
+    original = raw["choices"][0]["message"]
+    messages = fake.requests[1]["messages"]
+    index = messages.index(original)
+    assert messages[index + 1]["role"] == "tool"
+    assert messages[index + 1]["tool_call_id"] == original["tool_calls"][0]["id"]
+    assert json.loads(messages[index + 1]["content"]) == "u1"
+    records = [
+        json.loads(path.read_text()) for path in (gateway.trace.run_dir / "models").glob("*.json")
+    ]
+    assert any(record["response"] == raw for record in records)

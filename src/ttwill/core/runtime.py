@@ -319,13 +319,7 @@ class PersistentRuntime:
                 for index, message in enumerate(work.messages[work.base_messages :])
             ],
         ]
-        if work.result is not None:
-            messages.append(
-                (
-                    f"{work.instance_id}:reply",
-                    {"role": "assistant", "content": work.result["reply"]},
-                )
-            )
+        _append_reply(messages, work)
         self.archive.append_messages(self.thread_id, session.user_id, messages, turn=turn)
         for index, message in enumerate(work.invalid_outputs):
             self.archive.append(
@@ -549,13 +543,7 @@ class PersistentRuntime:
             (f"{work.instance_id}:message:{index}", message)
             for index, message in enumerate(work.messages[offset:], start=offset)
         ]
-        if work.result is not None:
-            messages_to_archive.append(
-                (
-                    f"{work.instance_id}:reply",
-                    {"role": "assistant", "content": work.result["reply"]},
-                )
-            )
+        _append_reply(messages_to_archive, work)
         self.archive.append_messages(
             self.thread_id, state.session.user_id, messages_to_archive, turn=state.turn
         )
@@ -576,6 +564,26 @@ class PersistentRuntime:
     def _next_node(values: RuntimeState) -> str:
         """有最终回复时等待用户，否则进入下一个协调决策节点。"""
         return "wait" if values.get("result") is not None else "advance"
+
+
+def _append_reply(entries: list[tuple[str, dict]], work: TurnState) -> None:
+    """向归档批次补入最终回复，模型原文已是实际回复时保留该条而不重复追加。
+
+    Args:
+        entries: 本次待归档的事件标识与消息列表，原地追加需要补存的回复。
+        work: 当前协调进度；未产生最终回复时不追加。模型原文中的思考字段保留。
+    """
+    if work.result is None:
+        return
+    reply = work.result["reply"]
+    last = entries[-1][1] if entries else {}
+    if (
+        last.get("role") == "assistant"
+        and not last.get("tool_calls")
+        and last.get("content") == reply
+    ):
+        return
+    entries.append((f"{work.instance_id}:reply", {"role": "assistant", "content": reply}))
 
 
 def _snapshot(state: ConversationState) -> dict:

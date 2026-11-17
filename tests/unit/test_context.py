@@ -108,11 +108,12 @@ def test_small_context_keeps_exact_inputs_without_model_call(runtime):
 
 
 def test_old_tool_result_is_referenced_before_any_summary(runtime):
-    """旧工具正文引用化后满足预算时，不增加模型调用且仍能回查完整结果。"""
+    """旧工具正文引用化保留调用配对及各轮思考字段，档案原文仍可回查。"""
     compiler, archive, fake = runtime(budget=1100)
     call = {
         "role": "assistant",
         "content": None,
+        "reasoning_content": "测试旧轮思考标记",
         "tool_calls": [
             {"id": "call1", "type": "function", "function": {"name": "query", "arguments": "{}"}}
         ],
@@ -120,14 +121,67 @@ def test_old_tool_result_is_referenced_before_any_summary(runtime):
     archive.append_message("thread", "u1", "call", call, turn=1)
     original = {"role": "tool", "tool_call_id": "call1", "content": "商品结果" * 3000}
     archive.append_message("thread", "u1", "result", original, turn=1)
+    recent = {
+        "role": "assistant",
+        "content": "订单已查询。",
+        "reasoning_content": "测试近期无工具回复的思考标记",
+    }
+    archive.append_message("thread", "u1", "recent", recent, turn=2)
     result = compile_context(compiler)
     tool = next(message for message in result if message["role"] == "tool")
     assert json.loads(tool["content"])["archive_reference"] == "result"
     assert tool["tool_call_id"] == "call1"
     assert call in result
+    assert recent in result
+    assert archive.get_event("thread", "u1", "call")["payload"] == call
     assert archive.get_event("thread", "u1", "result")["payload"] == original
     assert context_chars(result) <= 1100
     assert not fake.requests
+
+
+def test_summary_removes_whole_old_tool_round_and_preserves_recent_thinking(runtime):
+    """整轮摘要同时移除旧调用和结果，保留近期工具往返的完整思考与配对。"""
+    compiler, archive, fake = runtime([response("此前已查询第一笔订单。")], budget=1000)
+    old_call = {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "旧轮思考标记" * 500,
+        "tool_calls": [
+            {"id": "old-call", "type": "function", "function": {"name": "query", "arguments": "{}"}}
+        ],
+    }
+    old_result = {"role": "tool", "tool_call_id": "old-call", "content": "旧查询结果" * 500}
+    recent_call = {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "近期思考标记",
+        "tool_calls": [
+            {
+                "id": "recent-call",
+                "type": "function",
+                "function": {"name": "query", "arguments": "{}"},
+            }
+        ],
+    }
+    recent_result = {"role": "tool", "tool_call_id": "recent-call", "content": "近期查询结果"}
+    for event_id, message, turn in (
+        ("old-call", old_call, 1),
+        ("old-result", old_result, 1),
+        ("recent-call", recent_call, 2),
+        ("recent-result", recent_result, 2),
+    ):
+        archive.append_message("thread", "u1", event_id, message, turn=turn)
+
+    messages = compile_context(compiler)
+
+    assert len(fake.requests) == 1
+    assert messages[1]["content"] == SUMMARY_NOTICE + "\n此前已查询第一笔订单。"
+    assert recent_call in messages
+    assert recent_result in messages
+    assert "old-call" not in json.dumps(messages)
+    assert context_chars(messages) <= 1000
+    assert archive.get_event("thread", "u1", "old-call")["payload"] == old_call
+    assert archive.get_event("thread", "u1", "old-result")["payload"] == old_result
 
 
 def test_summary_is_single_call_marked_reference_and_reused(runtime):
