@@ -2,7 +2,7 @@
 
 面向买家的多品类电商客服 Agent：理解意愿，完成所托。
 
-第 0～6 步已通过离线验收；第 7 步已接入官方中文用户模拟器、单题运行入口与终态判分，真实模型单题验收待配置。LangGraph 检查点保存任务进度，协调者按用户确认提交，核验通过才完成任务，详见[实施计划](<docs/05 实施计划.md>)和[文档导航](<docs/00 项目定位.md#文档导航>)。`retail_50` 无模型参考重放实测 48/50 终态一致，另两题已确认为上游缺陷，原始差异单列保留。
+第 0～6 步已通过离线验收；第 7 步已接入官方中文用户模拟器、单题运行入口与终态判分，并取得真实模型单题结果：评测完成，该题业务失败。LangGraph 检查点保存任务进度，协调者按用户确认提交，核验通过才完成任务，详见[实施计划](<docs/05 实施计划.md>)和[文档导航](<docs/00 项目定位.md#文档导航>)。`retail_50` 无模型参考重放实测 48/50 终态一致，另两题已确认为上游缺陷，原始差异单列保留。
 
 ## 安装与检查
 
@@ -82,7 +82,7 @@ uv run pytest -q tests/acceptance
 
 ## 单题模型评测
 
-先安装 `bench` 可选依赖，将 `config.toml` 的 `flash` 档位改为真实兼容接口配置，密钥写入同目录 `.env`。模型 API 名称、地址和生成参数须明确配置；演示用零价格应删除或替换为已核实的价格，未配置价格时费用保持 `null`。所有角色共用一个档位时：
+先安装 `bench` 可选依赖。`config.toml` 的 `flash` 档位已配置官方 `https://api.deepseek.com`、API 模型名 `deepseek-flash` 和 `reasoning_effort = "high"`；该模型名对应 DeepSeek-V4.1-Flash-1017，见 [官方接入说明](https://api-docs.deepseek.com/zh-cn/)。密钥只写入同目录 `.env` 的 `TTWILL_API_KEY`。本体、模拟用户和判分共用此档位时：
 
 ```bash
 uv run --extra bench ttwill evaluate --task-id 6_zh_identity \
@@ -98,7 +98,9 @@ uv run --extra bench ttwill evaluate --task-id 6_zh_identity \
 
 每次尝试要求新目录，额外保存 `metadata.json`、`task.json`、`initial_database.json`、`final_database.json`、`user_prompt.json`、`simulation.json`、`messages.json` 和 `report.json`；中途失败时保存已产生的产物。配置快照不含密钥，代码及提示资源带内容哈希。全部模型调用进入统一轨迹、原文记录和 `usage.jsonl`，费用以此账本为准，不采用官方轨迹中可能缺失的 `agent_cost`。官方 LiteLLM 的隐式重试和缓存关闭，失败尝试保留；本体统一调用层仍按配置重试。重试耗尽的网络故障、超时或判分中断记为 `completed=false`，不填造任务失败分数。正常完成但业务不成功仍为已完成失败，命令退出码为 1。
 
-当前只完成离线适配验证，尚未调用真实模型，也未进入基线实现或正式实验。第 7 步须取得一次真实模型单题判分后才算验收完成。
+2026-11-17 首次真实运行保存在 `runs/step7-deepseek-task6-20261117-attempt-001/`：`completed=true`、`termination_reason=user_stop`、`db_match=false`、`task_success=false`，判分为 0。53 次 API 调用均成功返回，输入 258260、输出 33126、其中缓存输入 169088 token，费用未知。协调者多次违反工具调用约定，随后触发轮数及上下文预算上限；没有提交写操作，最终用户退出。这是已完成判分的业务失败，保留原尝试，不重跑覆盖。
+
+本题没有自然语言断言，因此没有实际调用判分模型；该链路仍只有离线模拟验证。`action_checks` 也不能用于本体网关动作覆盖统计，原因见[接入记录](<docs/07 调研_tau2-bench.md#第-7-步接入记录>)。第 7 步已取得要求的真实单题判分，不代表任务表现通过；基线与正式实验尚未开始，困难评测集仍须在 D 组表现调优前冻结。
 
 ## 假模型演示
 
@@ -146,7 +148,7 @@ uv run ttwill demo
 uv run ttwill trace runs/<run_id>/traces/<session_id>.jsonl
 ```
 
-演示会打印实际文件路径和 `session → turn → llm` 树，不需要密钥，也不会访问模型服务。默认 `config.toml` 中的 `fake-demo`、用量和零价格只用于演示，不代表真实服务的 API 标识、计量或定价。
+演示会打印实际文件路径和 `session → turn → llm` 树，不需要密钥，也不会访问模型服务。四个演示使用内存配置副本，将全部模型档位固定为 `fake-demo` 和零价格，保留用户配置的运行目录及预算；不修改真实配置文件。演示模型身份、用量和价格不代表真实服务的计量或定价。
 
 运行产物保存在配置指定的目录中，默认是 `runs/`，不进入 Git：
 
@@ -168,7 +170,7 @@ runs/<run_id>/
 
 业务代码通过 `LLMClient.complete("flash", messages, tools=...)` 指定档位；实际模型与参数来自 `config.toml`。`FakeModel` 接受响应或错误序列，用于离线测试；`CompatibleModel` 支持非流式 Chat Completions 接口，保留工具调用和服务返回的扩展字段。
 
-真实服务接入时，在配置中将对应档位的 `model` 改为实际 API 标识，设置 `base_url` 与 `api_key_env`，删除演示用的零价格或替换为已核实的美元/百万 token 单价。密钥只写入同目录 `.env`，变量名与 `api_key_env` 一致（参见 `.env.example`）。参数写入 `[models.flash.parameters]`，不能覆盖调用层的模型、消息、工具和流式设置。示例：
+切换真实服务时，在配置中填写实际 API `model`、`base_url` 与 `api_key_env`。密钥只写入同目录 `.env`，变量名与 `api_key_env` 一致（参见 `.env.example`）。参数写入 `[models.flash.parameters]`，不能覆盖调用层的模型、消息、工具和流式设置。当前固定官方默认思考强度 `high`，见 [思考模式说明](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)。使用统一调用层的示例：
 
 ```python
 from pathlib import Path
@@ -190,4 +192,6 @@ async with CompatibleModel(config.root / ".env") as backend:
 
 有用量但缺少价格，或服务未返回用量时，费用记为 `null`，不当作零。提供缓存用量时按缓存单价计算；未配置缓存单价则费用仍为未知。失败尝试也留在账本中，其未知用量不会伪造为零。价格均为配置估算，并非服务端结算金额。
 
-真实接口目前通过 HTTPX 模拟传输验证，尚未发起付费调用。协议参考 [DeepSeek Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/)，超时语义参考 [HTTPX 文档](https://www.python-httpx.org/advanced/timeouts/)。
+DeepSeek 当前按高峰和低峰时段计费，固定单价不能覆盖两种时段，因此本次配置暂不填写价格，完整保存输入、缓存输入和输出 token，费用保留 `null`；费率和时段见 [官方价格表](https://api-docs.deepseek.com/quick_start/pricing/)。需要费用估算时应注明所采用的时段及单价，不把未知费用填成零。
+
+真实接口已完成上述单题调用，自动测试继续使用 HTTPX 模拟传输或假模型。协议参考 [DeepSeek Chat Completions 文档](https://api-docs.deepseek.com/api/create-chat-completion/)，超时语义参考 [HTTPX 文档](https://www.python-httpx.org/advanced/timeouts/)。
