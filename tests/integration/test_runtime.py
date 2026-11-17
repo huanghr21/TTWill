@@ -83,8 +83,16 @@ def task_ids(request: dict) -> list[str]:
     raise AssertionError("协调模型输入缺少权威任务快照")
 
 
-def prepare_script(ids):
-    """先创建稳定任务，再结束计划、准备操作并向用户展示。"""
+def prepare_script(ids, *, combined=False):
+    """先创建稳定任务，再结束计划、准备操作并向用户展示。
+
+    Args:
+        ids: 从当前模型输入读取任务标识的函数。
+        combined: 是否在 complete_plan 同一次决策中分派已有任务。
+
+    Yields:
+        按执行顺序排列的协调工具响应，任务创建始终单独占用一次决策。
+    """
     yield tool(
         "update_tasks",
         {
@@ -99,8 +107,11 @@ def prepare_script(ids):
             ]
         },
     )
-    yield tool("complete_plan", {})
-    yield tool("dispatch_tasks", {"task_ids": ids()})
+    if combined:
+        yield tool("complete_plan", {"task_ids": ids()})
+    else:
+        yield tool("complete_plan", {})
+        yield tool("dispatch_tasks", {"task_ids": ids()})
     yield tool("reply", {"message_hint": "请确认"})
 
 
@@ -452,11 +463,16 @@ def test_reopened_session_reauthenticates_and_redisplays_before_confirmation(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("combined", [False, True])
 def test_prepare_survives_node_crash_without_checkpoint_operation_id(
-    runtime_factory, backend, monkeypatch
+    runtime_factory, backend, monkeypatch, combined
 ):
     """准备成功但节点未保存时，恢复按已存任务标识找回同一个操作。"""
     prepared = {}
+
+    def script(ids):
+        """分别通过独立分派或结束计划时分派，复用相同的稳定任务创建节点。"""
+        yield from prepare_script(ids, combined=combined)
 
     async def crash_after_prepare(state, context, task_ids):
         """模拟后端已提交准备事务、进程未写节点检查点的硬中断。
@@ -481,7 +497,7 @@ def test_prepare_survives_node_crash_without_checkpoint_operation_id(
 
     async def scenario():
         """断点前后分别重建检查点连接，验证稳定标识和原订单占用。"""
-        async with runtime_factory("chat1", prepare_script) as bundle:
+        async with runtime_factory("chat1", script) as bundle:
             runtime, coordinator, _, _, _, _ = bundle
             await open_u1(runtime)
             monkeypatch.setattr(coordinator, "_dispatch", crash_after_prepare)
@@ -492,6 +508,9 @@ def test_prepare_survives_node_crash_without_checkpoint_operation_id(
             old_task = next(iter(saved.tasks.tasks.values()))
             assert old_task.operation_ids == []
             assert old_task.revision == 1
+            assert prepared["request_key"] == request_key(
+                old_task.id, old_task.revision, old_task.action
+            )
         async with runtime_factory("chat2", followup_script) as bundle:
             runtime, _, _, _, child_fake, _ = bundle
             await open_u1(runtime)
@@ -508,6 +527,139 @@ def test_prepare_survives_node_crash_without_checkpoint_operation_id(
             rows = connection.execute(select(operations)).mappings().all()
         assert len(rows) == 1
         assert rows[0]["status"] == "prepared"
+
+    asyncio.run(scenario())
+
+
+def test_combined_confirmation_and_prepare_recover_before_node_checkpoint(
+    runtime_factory, backend, monkeypatch
+):
+    """组合节点已提交前项并准备后项时崩溃，恢复不重提且后项须重新展示后确认。"""
+    address = {
+        "address1": "新地址",
+        "address2": "",
+        "city": "上海",
+        "state": "上海",
+        "country": "中国",
+        "zip": "200001",
+    }
+
+    def script(ids):
+        """同单先准备改地址，下一轮确认地址并准备取消，任务创建保持独立。"""
+        yield tool(
+            "update_tasks",
+            {
+                "changes": [
+                    {
+                        "operation": "add",
+                        "capability": "order_service",
+                        "action": "modify_pending_order_address",
+                        "order_id": "#1",
+                        "instruction": "先将订单 #1 的地址改为指定新地址",
+                    },
+                    {
+                        "operation": "add",
+                        "capability": "order_service",
+                        "action": "cancel_pending_order",
+                        "order_id": "#1",
+                        "instruction": "改地址完成后，再取消订单 #1",
+                    },
+                ]
+            },
+        )
+        yield tool("complete_plan", {"task_ids": ids()[:1]})
+        yield tool("reply", {"message_hint": "请先确认修改地址"})
+        yield tool("complete_plan", {"task_ids": ids()[1:]})
+
+    def resumed_script(ids):
+        """新聊天先重新展示找回的准备项，之后才处理本聊天的新确认。"""
+        yield from followup_script(ids)
+        yield from followup_script(ids)
+
+    children = [
+        tool("load_skill", {"name": "modify_pending_order_address"}),
+        tool("modify_pending_order_address", {"order_id": "#1", **address}),
+        tool("finish", {"missing": [], "message_hint": "等待确认新地址"}),
+        *child_script(),
+    ]
+
+    async def scenario():
+        """制造真实提交与准备之后、节点检查点之前的窗口，再从原业务库对账。"""
+        async with runtime_factory("combined_crash", script, children) as bundle:
+            runtime, coordinator, gateway = bundle[:3]
+            await open_u1(runtime)
+            first = await runtime.send_message("先改订单 #1 地址，再取消订单 #1")
+            assert first["rounds"] == 3
+            first_task_id, second_task_id = [task["id"] for task in first["tasks"]]
+            first_operation = first["displayed"][0]["operation_id"]
+            original_dispatch = coordinator._dispatch
+            prepared = {}
+
+            async def crash_after_dispatch(state, context, task_ids):
+                """等待真实前项提交与后项准备完成，再阻止组合节点写入检查点。
+
+                Args:
+                    state: 组合节点内存状态，前项已由独立确认流程提交并核验。
+                    context: 当前已验证会话与协调实例。
+                    task_ids: 本次组合请求明确选择的后项任务。
+
+                Raises:
+                    OSError: 后项准备事务已完成，但组合节点尚未保存。
+                """
+                assert task_ids == [second_task_id]
+                assert state.tasks.tasks[first_task_id].status == "done"
+                assert backend.get_operation("u1", operation_id=first_operation)["status"] == (
+                    "committed"
+                )
+                await original_dispatch(state, context, task_ids)
+                second = state.tasks.tasks[second_task_id]
+                assert second.status == "pending_confirm"
+                prepared.update(backend.get_operation("u1", operation_id=second.operation_ids[0]))
+                raise OSError("模拟组合节点准备成功后退出")
+
+            monkeypatch.setattr(coordinator, "_dispatch", crash_after_dispatch)
+            with pytest.raises(OSError, match="组合节点准备成功"):
+                await runtime.send_message("确认")
+            saved = await runtime.snapshot()
+            assert saved.tasks.tasks[first_task_id].status == "pending_confirm"
+            assert saved.tasks.tasks[second_task_id].status == "pending"
+            assert saved.tasks.tasks[second_task_id].operation_ids == []
+            assert prepared["request_key"] == request_key(
+                second_task_id, saved.tasks.tasks[second_task_id].revision, "cancel_pending_order"
+            )
+            assert sum(record.get("kind") == "commit" for record in gateway.records) == 1
+
+        async with runtime_factory("combined_resumed", resumed_script) as bundle:
+            runtime, _, gateway, _, child_fake, _ = bundle
+            await open_u1(runtime)
+            restored = await runtime.snapshot()
+            assert restored.last_display == []
+            assert restored.tasks.tasks[first_task_id].status == "done"
+            second = restored.tasks.tasks[second_task_id]
+            assert second.status == "pending_confirm"
+            assert second.operation_ids == [prepared["operation_id"]]
+            assert second.revision == saved.tasks.tasks[second_task_id].revision
+            redisplayed = await runtime.send_message("确认")
+            assert redisplayed["confirmation_results"] == []
+            assert [item["operation_id"] for item in redisplayed["displayed"]] == [
+                prepared["operation_id"]
+            ]
+            order = backend.export_snapshot()["orders"]["#1"]
+            assert order["address"] == address and order["status"] == "pending"
+            assert not any(record.get("kind") == "commit" for record in gateway.records)
+            finished = await runtime.send_message("确认")
+            assert all(task["status"] == "done" for task in finished["tasks"])
+            assert [item["operation_id"] for item in finished["confirmation_results"]] == [
+                prepared["operation_id"]
+            ]
+            assert sum(record.get("kind") == "commit" for record in gateway.records) == 1
+            assert child_fake.requests == []
+
+        assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
+        for operation_id in (first_operation, prepared["operation_id"]):
+            history = backend.operation_events("u1", operation_id)
+            assert sum(event["status"] == "prepared" for event in history) == 1
+            assert sum(event["status"] == "committed" for event in history) == 1
 
     asyncio.run(scenario())
 

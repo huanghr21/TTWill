@@ -27,9 +27,13 @@ class UpdateTasks(BaseModel):
 
 
 class CompletePlan(BaseModel):
-    """声明本轮任务修改已经提出，由代码开始独立判定用户原话。"""
+    """结束本轮计划，由代码独立判定用户原话，再分派 task_ids 指定的已有任务。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
+    task_ids: list[str] = Field(
+        default_factory=list,
+        description="要在确认判定后分派的待执行或条件已满足任务；省略或空列表只结束计划",
+    )
 
 
 class DispatchTasks(BaseModel):
@@ -224,12 +228,14 @@ class Coordinator:
         if len(calls) != 1:
             work.invalid_outputs.append(deepcopy(response.message))
             self._guard(
-                "coordinator_format", "每轮须调用一个协调工具，可在 dispatch_tasks 中批量分派"
+                "coordinator_format",
+                "每轮须调用一个协调工具，可用 complete_plan 或 dispatch_tasks 的 task_ids 批量分派",
             )
             work.messages.append(
                 {
                     "role": "user",
-                    "content": "请只调用一个工具。需要多个任务时在同一 dispatch_tasks 中列出。",
+                    "content": "请只调用一个工具。结束计划并分派用 complete_plan(task_ids=[...])；"
+                    "计划结束后用 dispatch_tasks。",
                 }
             )
         else:
@@ -249,9 +255,11 @@ class Coordinator:
                     outcome = state.tasks.apply(updates.changes, self.gateway, context)
                 elif name == "complete_plan":
                     self._require_identity(state)
-                    CompletePlan.model_validate(arguments)
+                    plan = CompletePlan.model_validate(arguments)
                     if work.confirmed:
                         raise ValueError("本轮已经判定过用户确认")
+                    # 先拒绝无效选择，避免错误参数触发用户确认对应的业务提交。
+                    self._dispatch_candidates(state, plan.task_ids)
                     work.decisions = await self._confirm(
                         state, context, work.user_message, work.previous
                     )
@@ -260,6 +268,9 @@ class Coordinator:
                         "confirmation_results": work.decisions,
                         "tasks": state.tasks.snapshot(),
                     }
+                    if plan.task_ids:
+                        outcome.update(await self._dispatch(state, context, plan.task_ids))
+                        outcome["tasks"] = state.tasks.snapshot()
                 elif name == "dispatch_tasks":
                     self._require_identity(state)
                     if not work.confirmed:
@@ -342,7 +353,10 @@ class Coordinator:
         prompt = (
             "你是电商客服协调者，负责理解全部诉求并维护任务。每次调用一个工具。"
             "未验证身份时先查找用户，缺少邮箱或姓名+邮编时直接用 reply 询问；用户只能服务一个账户。"
-            "首先用 update_tasks 提出本轮所有新增、修改、撤销，再用 complete_plan 结束计划。"
+            "首先用 update_tasks 提出本轮所有新增、修改、撤销，再用 complete_plan 结束计划；"
+            "需要立即分派时在 complete_plan 的 task_ids 中列出已有待执行或条件已满足的任务。"
+            "代码先独立判定用户确认并核验，再分派；"
+            "task_ids 不表示用户授权，不能包含待确认或已结束任务。"
             "用户改口时必须在 complete_plan 之前更新旧任务，不能只据‘可以’提交。"
             "此后用 dispatch_tasks 选择任务，或用 update_tasks 撤销已不需要的条件备用任务。"
             "条件保持自然语言，由你判断；条件满足时明确分派该任务，不再需要则撤销并说明原因。"
@@ -576,13 +590,7 @@ class Coordinator:
             asyncio.CancelledError: 调用被取消；等待并行实例退出后向上传播。
             OSError: 业务或轨迹读写失败；先保留操作引用并停止并行实例。
         """
-        if len(set(task_ids)) != len(task_ids) or any(
-            key not in state.tasks.tasks for key in task_ids
-        ):
-            raise ValueError("分派任务不存在或重复")
-        tasks = [state.tasks.tasks[key] for key in task_ids]
-        if any(task.status not in {"pending", "conditional"} for task in tasks):
-            raise ValueError("只可分派待执行或条件已满足的任务；缺信息任务先更新完整要求")
+        tasks = self._dispatch_candidates(state, task_ids)
         occupied = {
             task.order_id
             for task in state.tasks.tasks.values()
@@ -618,6 +626,29 @@ class Coordinator:
                     self._interrupted_records(state, task)
             raise
         return {"dispatched": [task.to_dict() for task in selected], "blocked": blocked}
+
+    @staticmethod
+    def _dispatch_candidates(state: ConversationState, task_ids: list[str]) -> list[Task]:
+        """校验分派选择，不改变任务状态或触发业务操作。
+
+        Args:
+            state: 提供任务身份和当前状态的可信清单。
+            task_ids: 由工具参数校验后的任务 ID；空列表表示不分派。
+
+        Returns:
+            按选择顺序排列的任务；订单占用在实际分派时检查。
+
+        Raises:
+            ValueError: ID 重复、不存在，或任务不处于待执行 / 条件状态。
+        """
+        if len(set(task_ids)) != len(task_ids) or any(
+            key not in state.tasks.tasks for key in task_ids
+        ):
+            raise ValueError("分派任务不存在或重复")
+        tasks = [state.tasks.tasks[key] for key in task_ids]
+        if any(task.status not in {"pending", "conditional"} for task in tasks):
+            raise ValueError("只可分派待执行或条件已满足的任务；缺信息任务先更新完整要求")
+        return tasks
 
     async def _dispatch_one(
         self, state: ConversationState, context: CallContext, task: Task

@@ -966,3 +966,244 @@ def test_coordinator_replays_tool_reasoning_and_preserves_raw_record(runtime):
         json.loads(path.read_text()) for path in (gateway.trace.run_dir / "models").glob("*.json")
     ]
     assert any(record["response"] == raw for record in records)
+
+
+@pytest.mark.parametrize("condition", [None, "用户决定取消这笔订单时"])
+def test_complete_plan_can_prepare_selected_task_in_one_decision(runtime, backend, condition):
+    """结束计划可在同一次决策分派任务，减少一次调用且首次准备不视为用户授权。"""
+
+    def script(state):
+        """创建任务后一次完成计划与派工，再按实际准备结果展示。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [{**cancel_task("#1"), "condition": condition}]})
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+
+    coordinator, state, gateway, fake, child = runtime(script, cancel_steps("#1"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，确认取消订单 #1")
+    assert result["rounds"] == len(fake.requests) == 4
+    assert len(child.requests) == 3
+    assert result["tasks"][0]["status"] == "pending_confirm"
+    assert len(result["displayed"]) == 1 and result["confirmation_results"] == []
+    assert not any(record["kind"] == "commit" for record in gateway.records)
+    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    outcome = json.loads(
+        [message for message in fake.requests[-1]["messages"] if message["role"] == "tool"][-1][
+            "content"
+        ]
+    )
+    assert outcome["confirmation_results"] == [] and outcome["blocked"] == []
+    assert outcome["tasks"] == outcome["dispatched"] == result["tasks"]
+
+
+@pytest.mark.parametrize("arguments", [{}, {"task_ids": []}])
+def test_complete_plan_without_selection_keeps_separate_dispatch(runtime, backend, arguments):
+    """省略任务列表或传空列表都只结束计划，旧的独立分派流程保持不变。"""
+
+    def script(state):
+        """在完整计划结果之后才显式发起业务子任务。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("complete_plan", arguments)
+        assert child.requests == []
+        outcome = json.loads(
+            [message for message in fake.requests[-1]["messages"] if message["role"] == "tool"][-1][
+                "content"
+            ]
+        )
+        assert "dispatched" not in outcome and "blocked" not in outcome
+        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
+        yield reply()
+
+    coordinator, state, _, fake, child = runtime(script, cancel_steps("#1"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #1")
+    assert result["rounds"] == len(fake.requests) == 5
+    assert result["tasks"][0]["status"] == "pending_confirm"
+    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+
+
+def test_complete_plan_confirms_previous_action_before_dispatching_same_order(runtime, backend):
+    """合并调用先确认并核验前项，释放同单占用后才准备下一动作。"""
+
+    def script(state):
+        """同单先准备地址，用户确认后在一次计划调用内准备商品变更。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool(
+            "update_tasks",
+            {
+                "changes": [
+                    add_task("modify_pending_order_address", "#1", "收货地址改为北京新地址"),
+                    add_task(
+                        "modify_pending_order_items", "#1", "衬衫从 a 换成 b，差价用 gift 支付"
+                    ),
+                ]
+            },
+        )
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+        yield tool("complete_plan", {"task_ids": task_ids(state, status="pending")})
+        yield reply()
+        yield tool("complete_plan", {"task_ids": []})
+        yield reply()
+
+    children = prepare_steps("modify_pending_order_address", {"order_id": "#1", **ADDRESS})
+    children += prepare_steps(
+        "modify_pending_order_items",
+        {"order_id": "#1", "item_ids": ["a"], "new_item_ids": ["b"], "payment_method_id": "gift"},
+    )
+    coordinator, state, gateway, fake, _ = runtime(script, children)
+    first = turn(coordinator, state, "先改地址，再换商品规格")
+    assert [task["status"] for task in first["tasks"]] == ["pending_confirm", "pending"]
+    first_outcome = json.loads(
+        [message for message in fake.requests[-1]["messages"] if message["role"] == "tool"][-1][
+            "content"
+        ]
+    )
+    assert len(first_outcome["dispatched"]) == len(first_outcome["blocked"]) == 1
+    second = turn(coordinator, state, "确认")
+    assert second["rounds"] == 2
+    assert [task["status"] for task in second["tasks"]] == ["done", "pending_confirm"]
+    assert len(second["confirmation_results"]) == len(second["displayed"]) == 1
+    assert (
+        second["confirmation_results"][0]["operation_id"] == first["displayed"][0]["operation_id"]
+    )
+    snapshot = backend.export_snapshot()
+    assert snapshot["orders"]["#1"]["address"] == ADDRESS
+    assert snapshot["orders"]["#1"]["items"][0]["item_id"] == "a"
+    records = gateway.records
+    committed = next(index for index, record in enumerate(records) if record["kind"] == "commit")
+    prepared = next(
+        index
+        for index, record in enumerate(records)
+        if record["action"] == "modify_pending_order_items" and record.get("status") == "prepared"
+    )
+    assert committed < prepared
+    third = turn(coordinator, state, "确认")
+    assert all(task["status"] == "done" for task in third["tasks"])
+    assert backend.export_snapshot()["orders"]["#1"]["items"][0]["item_id"] == "b"
+
+
+@pytest.mark.parametrize(
+    "invalid_selection", ["unknown", "duplicate", "prepared", "string", "null", "number", "object"]
+)
+def test_invalid_plan_dispatch_selection_precedes_confirmation_side_effects(
+    runtime, backend, monkeypatch, invalid_selection
+):
+    """非法分派列表先于确认被拒，先前准备项未提交，修正请求后同轮仍可正常继续。"""
+    confirmations = []
+
+    def script(state):
+        """先展示第一单，次轮新增第二单并先给出一项不合法的合并调用。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+        yield tool("update_tasks", {"changes": [cancel_task("#4")]})
+        selected = task_ids(state, status="pending")[0]
+        candidates = {
+            "unknown": ["missing-task"],
+            "duplicate": [selected, selected],
+            "prepared": [task_ids(state, status="pending_confirm")[0]],
+            "string": selected,
+            "null": None,
+            "number": [7],
+            "object": {"task_id": selected},
+        }
+        yield tool("complete_plan", {"task_ids": candidates[invalid_selection]})
+        assert len(confirmations) == 1 and len(child.requests) == 3
+        assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+        assert not any(record["kind"] == "commit" for record in gateway.records)
+        yield tool("complete_plan", {"task_ids": [selected]})
+        yield reply()
+
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
+    original_confirm = coordinator._confirm
+
+    async def observe_confirmation(state, context, user_message, previous):
+        """记录确认的真实来源，继续执行原有确认与提交逻辑。
+
+        Args:
+            state: 当前任务状态。
+            context: 当前协调者的可信调用身份。
+            user_message: 本轮入口收到的真实用户原话。
+            previous: 最近一次实际回复展示的完整快照。
+
+        Returns:
+            原确认器给出的逐项判定与执行结果。
+        """
+        confirmations.append((user_message, previous))
+        return await original_confirm(state, context, user_message, previous)
+
+    monkeypatch.setattr(coordinator, "_confirm", observe_confirmation)
+    first = turn(coordinator, state, "取消 #1")
+    second = turn(coordinator, state, "确认")
+    assert second["rounds"] == 4
+    assert confirmations == [("取消 #1", []), ("确认", first["displayed"])]
+    assert [task["status"] for task in second["tasks"]] == ["done", "pending_confirm"]
+    assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#4"]["status"] == "pending"
+    assert sum(record["kind"] == "commit" for record in gateway.records) == 1
+
+
+def test_combined_plan_keeps_early_dispatch_and_multiple_tool_calls_blocked(runtime, backend):
+    """合并入口仍只接受一个工具调用，不允许先分派，也不执行同响应中的多个工具。"""
+
+    def script(state):
+        """先产生两种协议错误，再用合法合并调用准备并展示操作。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        selection = {"task_ids": task_ids(state)}
+        yield tool("dispatch_tasks", selection)
+        assert child.requests == []
+        combined = tool("complete_plan", selection)
+        combined["choices"][0]["message"]["tool_calls"].extend(
+            tool("dispatch_tasks", selection)["choices"][0]["message"]["tool_calls"]
+        )
+        yield combined
+        assert child.requests == []
+        yield tool("complete_plan", selection)
+        yield reply()
+
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1"))
+    result = turn(coordinator, state, "取消 #1")
+    assert result["rounds"] == 6 and len(child.requests) == 3
+    assert result["tasks"][0]["status"] == "pending_confirm"
+    events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+    guards = [
+        event["name"]
+        for event in events
+        if event["kind"] == "guard"
+        and event["event"] == "end"
+        and event["name"].startswith("coordinator_")
+    ]
+    assert guards == ["coordinator_tool", "coordinator_format"]
+    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+
+
+def test_completed_task_in_plan_selection_rejects_entire_batch(runtime, backend):
+    """选择列表包含已完成任务时整批拒绝，不能静默跳过它并派出其他待办任务。"""
+
+    def script(state):
+        """完成首单后混选旧任务和新任务，纠正选择后才准备新单。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+        yield tool("complete_plan", {})
+        yield reply()
+        yield tool("update_tasks", {"changes": [cancel_task("#4")]})
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
+        assert len(child.requests) == 3
+        assert [task.status for task in state.tasks.tasks.values()] == ["done", "pending"]
+        yield tool("complete_plan", {"task_ids": task_ids(state, status="pending")})
+        yield reply()
+
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
+    turn(coordinator, state, "取消 #1")
+    turn(coordinator, state, "确认")
+    result = turn(coordinator, state, "还要取消 #4")
+    assert result["rounds"] == 4
+    assert [task["status"] for task in result["tasks"]] == ["done", "pending_confirm"]
+    assert len(child.requests) == 6
+    assert sum(record["kind"] == "commit" for record in gateway.records) == 1
+    assert backend.export_snapshot()["orders"]["#4"]["status"] == "pending"
