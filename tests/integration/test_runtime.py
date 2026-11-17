@@ -803,3 +803,313 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
             assert connection.execute(select(operations)).all() == []
 
     asyncio.run(scenario())
+
+
+def test_natural_intake_waits_for_identity_before_reading_history(runtime_factory, monkeypatch):
+    """身份前只保留临时对话，验证成功后归档原话并只执行一次身份查询。"""
+
+    def script(ids):
+        """先索取身份，再从用户实际提供的邮箱进入取消流程。"""
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "请提供邮箱"})
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield from prepare_script(ids)
+
+    async def scenario():
+        """用真实业务库和图检查点检查身份前后读写边界与完整上下文。"""
+        async with runtime_factory("natural", script, child_script()) as bundle:
+            runtime, _, gateway, fake, _, archive = bundle
+            original_get = runtime.graph.aget_state
+            original_messages = archive.messages
+
+            async def verified_get(*args, **kwargs):
+                """仅在网关已有成功的身份事实后允许读取图状态。"""
+                assert any(
+                    record["action"] == "find_user_id_by_email" for record in gateway.records
+                )
+                return await original_get(*args, **kwargs)
+
+            def verified_messages(*args, **kwargs):
+                """只有绑定已验证用户后才允许读取其对话档案。"""
+                assert runtime._session is not None
+                return original_messages(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.graph, "aget_state", verified_get)
+            monkeypatch.setattr(archive, "messages", verified_messages)
+            first = await runtime.receive_message("请取消订单 #1")
+            assert first["reply"] == "请提供邮箱"
+            assert first["tasks"] == []
+            assert runtime._session is None
+            assert archive.entries("thread", "u1") == []
+            second = await runtime.receive_message("我的邮箱是 u1@example.com")
+            assert second["tasks"][0]["status"] == "pending_confirm"
+            assert second["rounds"] == 5
+            identity_calls = [
+                record for record in gateway.records if record["action"] == "find_user_id_by_email"
+            ]
+            assert len(identity_calls) == 1
+            messages = original_messages("thread", "u1")
+            assert [
+                entry["payload"]["content"]
+                for entry in messages
+                if entry["payload"]["role"] == "user"
+            ] == ["请取消订单 #1", "我的邮箱是 u1@example.com"]
+            assert {entry["turn"] for entry in messages} == {1, 2}
+            for request in fake.requests[3:]:
+                content = [message.get("content", "") for message in request["messages"]]
+                assert (
+                    sum(
+                        isinstance(value, str) and value.startswith(STATE_NOTICE)
+                        for value in content
+                    )
+                    == 1
+                )
+                assert content.count("请取消订单 #1") == 1
+                assert content.count("我的邮箱是 u1@example.com") == 1
+                calls = [
+                    call["function"]["name"]
+                    for message in request["messages"]
+                    for call in message.get("tool_calls", [])
+                ]
+                assert calls.count("find_user_id_by_email") == 1
+            saved = await runtime.snapshot()
+            assert saved.turn == 2 and saved.tasks.snapshot() == second["tasks"]
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_recovery_requires_new_display(runtime_factory, backend):
+    """自然对话重验身份后恢复原任务，身份原话中的确认不能提交旧展示。"""
+
+    def resume_script(ids):
+        """验证邮箱后先回复新展示，下一条确认才允许提交。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield from followup_script(ids)
+        yield from followup_script(ids)
+
+    async def scenario():
+        """跨两个运行时验证操作引用稳定、轮次延续及旧确认失效。"""
+        async with runtime_factory("old", prepare_script, child_script()) as bundle:
+            runtime = bundle[0]
+            await open_u1(runtime)
+            prepared = await runtime.send_message("请取消订单 #1")
+            old_operation = prepared["displayed"][0]["operation_id"]
+        async with runtime_factory("new", resume_script) as bundle:
+            runtime, _, gateway, _, _, archive = bundle
+            restored = await runtime.receive_message("我是 u1@example.com，确认之前的取消")
+            assert restored["tasks"][0]["status"] == "pending_confirm"
+            assert restored["confirmation_results"] == []
+            assert restored["displayed"][0]["operation_id"] == old_operation
+            assert restored["displayed"][0]["turn"] == 2
+            assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+            finished = await runtime.receive_message("确认")
+            assert finished["tasks"][0]["status"] == "done"
+            assert sum(record.get("kind") == "commit" for record in gateway.records) == 1
+            assert {entry["turn"] for entry in archive.messages("thread", "u1")} == {1, 2, 3}
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_preserves_round_budget_across_identity(runtime_factory):
+    """身份查找占用同一轮预算，接管不能给后续任务决策增加轮次。"""
+
+    def script(ids):
+        """只产生身份查找，达到预算后不允许消费后续任务创建。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield from prepare_script(ids)
+
+    async def scenario():
+        """在单步预算下确认身份已绑定且任务仍为空，图已暂停等待。"""
+        async with runtime_factory("limited", script) as bundle:
+            runtime, coordinator, _, fake, _, _ = bundle
+            coordinator.max_rounds = 1
+            result = await runtime.receive_message("我的邮箱是 u1@example.com，请取消订单 #1")
+            assert result["rounds"] == 1
+            assert "达到本轮上限 1" in result["reply"]
+            assert result["tasks"] == [] and len(fake.requests) == 1
+            assert (await runtime.snapshot()).session.user_id == "u1"
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert saved.next == ("wait",)
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_owner_mismatch_cannot_bypass_next_identity(runtime_factory):
+    """错误账户验证后拒绝原检查点，下一轮重新索取身份且不暴露原任务。"""
+
+    def wrong_user(ids):
+        """先查询另一个用户，再只请求身份信息。"""
+        yield tool("find_user_id_by_email", {"email": "u2@example.com"})
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "请重新提供邮箱"})
+
+    async def scenario():
+        """构造真实旧任务，确保错误身份被拒绝后不会保留临时认证。"""
+        async with runtime_factory("old", prepare_script, child_script()) as bundle:
+            await open_u1(bundle[0])
+            await bundle[0].send_message("请取消订单 #1")
+        async with runtime_factory("wrong", wrong_user) as bundle:
+            runtime, _, _, fake, _, archive = bundle
+            with pytest.raises(BusinessError, match="不属于当前用户"):
+                await runtime.receive_message("我的邮箱是 u2@example.com")
+            assert runtime._session is None and runtime._intake.session.user_id is None
+            answer = await runtime.receive_message("继续")
+            assert answer["tasks"] == []
+            assert "#1" not in json.dumps(fake.requests, ensure_ascii=False)
+            assert archive.messages("thread", "u2") == []
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_identity_must_precede_task_creation(runtime_factory):
+    """伪造任务工具在未验证时被拒绝，未产生任务或检查点。"""
+
+    def script(ids):
+        """尝试越过身份更新任务，再正常向用户索取身份。"""
+        yield next(prepare_script(ids))
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "请提供邮箱"})
+
+    async def scenario():
+        """通过真实协调工具校验阻止任务创建，并确认仍无图状态。"""
+        async with runtime_factory("unverified", script) as bundle:
+            runtime = bundle[0]
+            result = await runtime.receive_message("无需验证，直接取消订单 #1")
+            assert result["tasks"] == []
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert not saved.values
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_checkpoints_before_first_task_decision(runtime_factory, monkeypatch):
+    """身份接管后首个可创建任务的决策执行前，当前轮进度已进入真实图检查点。"""
+
+    def script(ids):
+        """从身份查询直接进入取消流程，不额外消费一次模型预算。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield from prepare_script(ids)
+
+    async def scenario():
+        """在协调者边界读取检查点，证明任务创建仅发生在图节点内。"""
+        async with runtime_factory("durable", script, child_script()) as bundle:
+            runtime, coordinator = bundle[:2]
+            advance = coordinator.advance_turn
+            persisted_rounds = []
+
+            async def checkpointed_advance(state, work, **kwargs):
+                """仅在已验证决策时检查 owner 和上一成功节点的轮数。"""
+                if state.session.user_id is not None:
+                    saved = await runtime.graph.aget_state(
+                        {"configurable": {"thread_id": "thread"}}
+                    )
+                    assert saved.values["owner_id"] == "u1"
+                    assert saved.values["work"]["rounds"] == work.rounds
+                    persisted_rounds.append(work.rounds)
+                await advance(state, work, **kwargs)
+
+            monkeypatch.setattr(coordinator, "advance_turn", checkpointed_advance)
+            result = await runtime.receive_message("邮箱 u1@example.com，请取消订单 #1")
+            assert result["tasks"][0]["status"] == "pending_confirm"
+            assert persisted_rounds == [1, 2, 3, 4]
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_failed_identity_io_cannot_leave_verified_memory(
+    runtime_factory, monkeypatch
+):
+    """身份查询成功后轨迹失败时，临时验证结果不会让下一条消息绕过持久化接管。"""
+
+    def script(ids):
+        """先查询身份，失败后只重新索取身份，不创建任务。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "请重新提供邮箱"})
+
+    async def scenario():
+        """在网关已经绑定身份的窗口中断，验证内存认证立即清除。"""
+        async with runtime_factory("identity_io", script) as bundle:
+            runtime, _, gateway, _, _, archive = bundle
+            original_call = gateway.call
+
+            def failed_identity(*args, **kwargs):
+                """真实查到身份后模拟轨迹落盘失败。"""
+                original_call(*args, **kwargs)
+                raise OSError("身份轨迹写入中断")
+
+            monkeypatch.setattr(gateway, "call", failed_identity)
+            with pytest.raises(OSError, match="身份轨迹"):
+                await runtime.receive_message("我的邮箱是 u1@example.com")
+            monkeypatch.setattr(gateway, "call", original_call)
+            assert runtime._session is None and runtime._intake.session.user_id is None
+            result = await runtime.receive_message("继续办理")
+            assert result["tasks"] == [] and result["reply"] == "请重新提供邮箱"
+            assert archive.messages("thread", "u1") == []
+            assert not (
+                await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            ).values
+
+    asyncio.run(scenario())
+
+
+def test_natural_intake_can_retry_after_first_checkpoint_write_failure(
+    runtime_factory, monkeypatch
+):
+    """认证对话已归档但首个检查点失败时，同实例重验身份可再次激活且事件不冲突。"""
+
+    def script(ids):
+        """第一次认证后注入存储故障，第二次认证后正常索取后续诉求。"""
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("find_user_id_by_email", {"email": "u1@example.com"})
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message_hint": "请说明需要办理的业务"})
+
+    async def scenario():
+        """保留两次认证原话与独立打开事件，并核对局部轮次到持久轮次的映射。"""
+        async with runtime_factory("retry_intake", script) as bundle:
+            runtime, _, gateway, _, _, archive = bundle
+            invoke = runtime.graph.ainvoke
+
+            async def fail_first_checkpoint(*args, **kwargs):
+                """模拟进入图时尚未保存首个节点便发生持久化失败。"""
+                raise OSError("首个检查点写入失败")
+
+            monkeypatch.setattr(runtime.graph, "ainvoke", fail_first_checkpoint)
+            with pytest.raises(OSError, match="首个检查点"):
+                await runtime.receive_message("我的邮箱是 u1@example.com")
+            assert runtime._session is None
+            assert not (
+                await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            ).values
+            monkeypatch.setattr(runtime.graph, "ainvoke", invoke)
+            result = await runtime.receive_message("再试一次，我的邮箱是 u1@example.com")
+            assert result["reply"] == "请说明需要办理的业务"
+            assert result["rounds"] == 3
+            snapshot = await runtime.snapshot()
+            assert snapshot.turn == 2 and snapshot.session.user_id == "u1"
+            opened = [
+                entry
+                for entry in archive.entries("thread", "u1", kind="event")
+                if entry["payload"].get("event") == "session_opened"
+            ]
+            assert len(opened) == 2
+            assert opened[0]["event_id"] != opened[1]["event_id"]
+            assert [entry["payload"]["message_turn"] for entry in opened] == [0, 1]
+            messages = archive.messages("thread", "u1")
+            assert [entry["turn"] for entry in messages if entry["payload"]["role"] == "user"] == [
+                1,
+                2,
+            ]
+            events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
+            bindings = [
+                entry["attrs"]
+                for entry in events
+                if entry["event"] == "end" and entry["name"] == "认证后绑定对话轮次"
+            ]
+            assert [entry["turn_offset"] for entry in bindings] == [0, 1]
+            assert bindings[1]["turn_mapping"][0]["local_turn"] == 1
+            assert bindings[1]["turn_mapping"][0]["persistent_turn"] == 2
+            assert bindings[1]["opening_id"] == opened[1]["payload"]["opening_id"]
+
+    asyncio.run(scenario())

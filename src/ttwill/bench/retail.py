@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 TAU2_COMMIT = "c06b07dd7c4d4ec61ba6ff9bcdf0b15dd7ef36d4"
-SOURCE_FILES = ("tau2_zh_retail.json", "retail_50.json", "LICENSE.tau2")
+SOURCE_FILES = ("tau2_zh_retail.json", "retail_50.json", "LICENSE.tau2", "tau2_zh_pack.yaml")
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,7 @@ class RetailBundle:
         metadata: 按中文任务 ID 索引的元信息，包含对应的原始任务 ID。
         settings: 数据包的语言等编译设置。
         manifest: 固定提交、来源文件及其校验值的清单。
+        language_pack: 校验过的官方中文语言包 YAML 原文，仅由评测适配层解析。
     """
 
     database: dict[str, Any]
@@ -29,6 +30,7 @@ class RetailBundle:
     metadata: dict[str, Any]
     settings: dict[str, Any]
     manifest: dict[str, Any]
+    language_pack: str
 
 
 def load_retail_bundle(source_dir: Path) -> RetailBundle:
@@ -69,4 +71,5 @@ def load_retail_bundle(source_dir: Path) -> RetailBundle:
         metadata=bundle["metadata"],
         settings=bundle["settings"],
         manifest=manifest,
+        language_pack=contents["tau2_zh_pack.yaml"].decode("utf-8"),
     )

@@ -1,4 +1,4 @@
-"""提供假模型演示、业务准备与提交、离线重放和轨迹查看。"""
+"""提供本体演示、业务操作、离线重放、单题评测和轨迹查看。"""
 
 import argparse
 import asyncio
@@ -216,6 +216,16 @@ def main() -> None:
     bench = subparsers.add_parser("bench", help="离线参考动作重放，需要 bench 可选依赖")
     bench.add_argument("--source", type=Path, default=Path("data/source"))
     bench.add_argument("--output", type=Path, required=True, help="新的重放产物目录")
+    evaluate = subparsers.add_parser("evaluate", help="运行一题官方用户模拟与终态判分")
+    evaluate.add_argument("--config", type=Path, default=Path("config.toml"))
+    evaluate.add_argument("--task-id", required=True, help="固定中文 retail_50 的题目标识")
+    evaluate.add_argument("--output", type=Path, required=True, help="尚不存在的尝试目录")
+    evaluate.add_argument("--user-tier", default="user_simulator")
+    evaluate.add_argument("--judge-tier", default="evaluator")
+    evaluate.add_argument("--seed", type=int, default=0)
+    evaluate.add_argument("--repeat", type=int, default=1)
+    evaluate.add_argument("--max-steps", type=int, default=100)
+    evaluate.add_argument("--timeout-seconds", type=float, default=600)
     args = parser.parse_args()
     try:
         if args.command == "demo":
@@ -242,6 +252,34 @@ def main() -> None:
             print(render_tree(args.path))
         elif args.command == "business":
             print(json.dumps(run_business(args), ensure_ascii=False, indent=2))
+        elif args.command == "evaluate":
+            from openai import APIError
+
+            from ttwill.bench.evaluation import EvaluationIncompleteError
+            from ttwill.bench.runner import run_single
+            from ttwill.llm import LLMError
+
+            try:
+                report = run_single(
+                    args.config,
+                    args.task_id,
+                    args.output,
+                    user_tier=args.user_tier,
+                    judge_tier=args.judge_tier,
+                    seed=args.seed,
+                    repeat=args.repeat,
+                    max_steps=args.max_steps,
+                    timeout_seconds=args.timeout_seconds,
+                )
+            except (APIError, LLMError, EvaluationIncompleteError, TimeoutError) as exc:
+                parser.exit(
+                    2,
+                    f"评测未完成：{type(exc).__name__}；"
+                    f"尝试记录：{(args.output / 'report.json').resolve()}\n",
+                )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if not report["task_success"]:
+                raise SystemExit(1)
         else:
             from ttwill.bench.replay import replay_retail_50
             from ttwill.bench.retail import load_retail_bundle

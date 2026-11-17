@@ -22,6 +22,7 @@ def test_official_chinese_bundle_contains_the_frozen_subset() -> None:
     assert all(task["initial_state"] is None for task in bundle.tasks)
     assert bundle.settings["currency_code"] == "CNY"
     assert "explicit user confirmation" in bundle.policy
+    assert "agent_greeting: 您好！请问有什么可以帮您？" in bundle.language_pack
 
 
 def test_source_hash_rejects_modified_data(tmp_path: Path) -> None:
@@ -31,4 +32,14 @@ def test_source_hash_rejects_modified_data(tmp_path: Path) -> None:
     with (target / "tau2_zh_retail.json").open("ab") as stream:
         stream.write(b"\n")
     with pytest.raises(ValueError, match="来源文件校验失败"):
+        load_retail_bundle(target)
+
+
+def test_source_hash_rejects_modified_language_pack(tmp_path: Path) -> None:
+    """中文人设原文与业务数据库使用同样的固定来源字节校验。"""
+    target = tmp_path / "source"
+    shutil.copytree(SOURCE_DIR, target)
+    with (target / "tau2_zh_pack.yaml").open("ab") as stream:
+        stream.write(b"\n")
+    with pytest.raises(ValueError, match="来源文件校验失败：tau2_zh_pack.yaml"):
         load_retail_bundle(target)

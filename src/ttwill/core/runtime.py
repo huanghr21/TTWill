@@ -11,7 +11,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import START, StateGraph
 from langgraph.types import Command, interrupt
 
-from ttwill.core.context import ContextBudgetExceeded, ContextCompiler
+from ttwill.core.context import ContextBudgetExceeded, ContextCompiler, context_chars
 from ttwill.core.coordinator import ConversationState, Coordinator, TurnState
 from ttwill.core.recovery import reconcile_restored_tasks
 from ttwill.core.tasks import Task
@@ -27,6 +27,7 @@ class RuntimeState(TypedDict):
 
     owner_id: str
     database_path: str
+    opening_id: str
     conversation: dict
     work: dict | None
     request: str | None
@@ -65,6 +66,8 @@ class PersistentRuntime:
         self.thread_id = thread_id
         self._session: SessionContext | None = None
         self._state: ConversationState | None = None
+        self._intake = ConversationState(SessionContext(coordinator.gateway.trace.session_id))
+        self._intake_turns: list[TurnState] = []
         lock_key = (str(coordinator.gateway.database_path), thread_id)
         self._lock = _thread_locks.setdefault(lock_key, asyncio.Lock())
         self._config = {
@@ -76,7 +79,7 @@ class PersistentRuntime:
         builder.add_node("wait", self._wait)
         builder.add_node("begin", self._begin)
         builder.add_node("advance", self._advance)
-        builder.add_edge(START, "restore")
+        builder.add_conditional_edges(START, self._start_node)
         builder.add_edge("restore", "wait")
         builder.add_edge("wait", "begin")
         builder.add_edge("begin", "advance")
@@ -141,6 +144,7 @@ class PersistentRuntime:
             initial: RuntimeState = {
                 "owner_id": session.user_id,
                 "database_path": database_path,
+                "opening_id": uuid4().hex,
                 "conversation": _snapshot(state),
                 "work": None,
                 "request": None,
@@ -161,6 +165,178 @@ class PersistentRuntime:
                 "resumed": bool(values),
             }
 
+    async def receive_message(self, user_message: str) -> dict:
+        """从自然对话验证身份，再在同一轮接入持久化任务处理。
+
+        Args:
+            user_message: 当前用户原话；邮箱或姓名与邮编由协调模型从对话提取。
+
+        Returns:
+            含 reply、tasks、displayed、confirmation_results 和 rounds 的回复。
+            身份确认前只能查找用户或回复，不能创建任务，也不读取历史检查点和档案。
+
+        Raises:
+            ValueError: 用户消息为空。
+            BusinessError: 验证后的用户或业务库与原检查点不符，或会话已被接续。
+            asyncio.CancelledError: 调用被取消；认证接管失败后须重新验证身份。
+            OSError: 轨迹、档案或检查点读写失败。
+        """
+        if not isinstance(user_message, str) or not user_message.strip():
+            raise ValueError("用户消息不能为空")
+        async with self._lock:
+            if self._session is not None:
+                return await self._send_message(user_message)
+            state = self._intake
+            trace = self.coordinator.gateway.trace
+            with trace.span("turn", "自然对话身份接入", turn=state.turn + 1):
+                with trace.span("coordinator", "身份接入协调", attrs={"thread_id": self.thread_id}):
+                    work = self.coordinator.begin_turn(state, user_message)
+                    self._intake_turns.append(work)
+                    while work.result is None:
+                        context = CallContext(state.session, "coordinator", work.instance_id)
+                        tools = self.coordinator._schemas(context, work.confirmed)
+                        if context_chars(work.messages, tools) > self.compiler.max_chars:
+                            self.coordinator.stop_turn(
+                                state, work, "身份验证前的对话超过上下文字符预算，请重新开始会话"
+                            )
+                        else:
+                            try:
+                                await self.coordinator.advance_turn(
+                                    state, work, messages=work.messages
+                                )
+                            except (asyncio.CancelledError, OSError):
+                                self._intake = ConversationState(SessionContext(trace.session_id))
+                                self._intake_turns = []
+                                raise
+                        if state.session.user_id is not None:
+                            return await self._activate_intake(work)
+                    return deepcopy(work.result)
+
+    async def _activate_intake(self, work: TurnState) -> dict:
+        """在身份查询成功后接管当前轮次，任务创建前先保存图检查点。
+
+        Args:
+            work: 尚未分派业务任务的本轮进度，保留原话、工具往返和已用轮数。
+
+        Returns:
+            接管后推进到等待节点产生的最终回复。
+
+        Raises:
+            BusinessError: 当前身份或业务库与旧检查点不符。
+            OSError: 恢复、归档或图推进失败；再次接入须重新提供身份。
+        """
+        session = self._intake.session
+        activated = False
+        try:
+            saved = await self.graph.aget_state(self._config)
+            values = saved.values
+            if values and values["owner_id"] != session.user_id:
+                raise BusinessError("任务检查点不属于当前用户", code="checkpoint_owner_mismatch")
+            database_path = str(self.coordinator.gateway.database_path)
+            if values and values["database_path"] != database_path:
+                raise BusinessError("续办须使用任务原业务库", code="checkpoint_database_mismatch")
+            state = (
+                _conversation(values["conversation"], session)
+                if values
+                else ConversationState(session)
+            )
+            self._session = session
+            initial: RuntimeState = {
+                "owner_id": session.user_id,
+                "database_path": database_path,
+                "opening_id": uuid4().hex,
+                "conversation": _snapshot(state),
+                "work": None,
+                "request": None,
+                "result": None,
+            }
+            restored = self._restore(initial)
+            state = _conversation(restored["conversation"], session)
+            turn_offset = state.turn
+            state.turn += len(self._intake_turns)
+            self._state = state
+            with self.coordinator.gateway.trace.span(
+                "recovery",
+                "认证后绑定对话轮次",
+                turn=state.turn,
+                attrs={
+                    "opening_id": initial["opening_id"],
+                    "turn_offset": turn_offset,
+                    "turn_mapping": [
+                        {
+                            "instance_id": intake_work.instance_id,
+                            "local_turn": index,
+                            "persistent_turn": turn_offset + index,
+                        }
+                        for index, intake_work in enumerate(self._intake_turns, start=1)
+                    ],
+                },
+            ):
+                pass
+            # 新聊天没有旧授权；本轮原话只可确认本聊天上一条实际展示。
+            work.previous = []
+            work.decisions = []
+            if work.result is not None:
+                self.coordinator.stop_turn(
+                    state, work, f"协调者达到本轮上限 {self.coordinator.max_rounds}，未完成本轮处理"
+                )
+            for index, intake_work in enumerate(self._intake_turns, start=1):
+                self._archive_intake(intake_work, turn_offset + index)
+            current_messages = work.messages[work.base_messages :]
+            work.messages = [
+                work.messages[0],
+                {"role": "user", "content": work.user_message},
+                *current_messages,
+            ]
+            work.base_messages = 2
+            initial.update(conversation=_snapshot(state), work=asdict(work), result=work.result)
+            result = await self.graph.ainvoke(initial, self._config, durability="sync")
+            self._state = _conversation(result["conversation"], session)
+            activated = True
+            return deepcopy(result["result"])
+        finally:
+            # 已验证但未接管成功的临时对象不能在下一轮绕过身份入口。
+            self._intake = ConversationState(
+                SessionContext(self.coordinator.gateway.trace.session_id)
+            )
+            self._intake_turns = []
+            if not activated:
+                self._session = None
+                self._state = None
+
+    def _archive_intake(self, work: TurnState, turn: int) -> None:
+        """在身份归属确定后补存认证对话，不把临时任务快照写入历史。
+
+        Args:
+            work: 认证阶段某一轮的原话、真实工具往返和可选最终回复。
+            turn: 以原检查点和档案最大轮次为偏移的全线程轮次。
+        """
+        session = self._require_session()
+        messages = [
+            (f"{work.instance_id}:user", {"role": "user", "content": work.user_message}),
+            *[
+                (f"{work.instance_id}:intake:{index}", message)
+                for index, message in enumerate(work.messages[work.base_messages :])
+            ],
+        ]
+        if work.result is not None:
+            messages.append(
+                (
+                    f"{work.instance_id}:reply",
+                    {"role": "assistant", "content": work.result["reply"]},
+                )
+            )
+        self.archive.append_messages(self.thread_id, session.user_id, messages, turn=turn)
+        for index, message in enumerate(work.invalid_outputs):
+            self.archive.append(
+                self.thread_id,
+                session.user_id,
+                f"{work.instance_id}:invalid:{index}",
+                "event",
+                {"event": "invalid_model_output", "message": message},
+                turn=turn,
+            )
+
     async def send_message(self, user_message: str) -> dict:
         """从等待节点接收真实用户消息，执行到下一次等待并返回已保存的回复。
 
@@ -179,23 +355,39 @@ class PersistentRuntime:
         if not isinstance(user_message, str) or not user_message.strip():
             raise ValueError("用户消息不能为空")
         async with self._lock:
-            session = self._require_session()
-            saved = await self.graph.aget_state(self._config)
-            self._check_saved_session(saved.values)
-            if saved.next != ("wait",) or not any(task.interrupts for task in saved.tasks):
-                raise BusinessError(
-                    "上次执行尚未完成，请重新验证身份后恢复", code="reopen_required"
+            return await self._send_message(user_message)
+
+    async def _send_message(self, user_message: str) -> dict:
+        """在调用方已持有线程锁时推进已验证会话的一轮消息。
+
+        Args:
+            user_message: 已由公开入口校验的非空用户原话。
+
+        Returns:
+            下一等待节点保存的协调结果。
+        """
+        session = self._require_session()
+        saved = await self.graph.aget_state(self._config)
+        self._check_saved_session(saved.values)
+        if saved.next != ("wait",) or not any(task.interrupts for task in saved.tasks):
+            raise BusinessError("上次执行尚未完成，请重新验证身份后恢复", code="reopen_required")
+        trace = self.coordinator.gateway.trace
+        with trace.span(
+            "turn", "持久化处理用户消息", turn=saved.values["conversation"]["turn"] + 1
+        ):
+            with trace.span("coordinator", "检查点协调", attrs={"thread_id": self.thread_id}):
+                result = await self.graph.ainvoke(
+                    Command(resume=user_message), self._config, durability="sync"
                 )
-            trace = self.coordinator.gateway.trace
-            with trace.span(
-                "turn", "持久化处理用户消息", turn=saved.values["conversation"]["turn"] + 1
-            ):
-                with trace.span("coordinator", "检查点协调", attrs={"thread_id": self.thread_id}):
-                    result = await self.graph.ainvoke(
-                        Command(resume=user_message), self._config, durability="sync"
-                    )
-            self._state = _conversation(result["conversation"], session)
-            return deepcopy(result["result"])
+        self._state = _conversation(result["conversation"], session)
+        return deepcopy(result["result"])
+
+    @staticmethod
+    def _start_node(values: RuntimeState) -> str:
+        """身份接管保留当前决策进度，显式打开会话则先执行恢复节点。"""
+        if values.get("work") is None:
+            return "restore"
+        return "wait" if values.get("result") is not None else "advance"
 
     async def snapshot(self) -> ConversationState:
         """在当前会话仍有效时读取唯一的图检查点状态。
@@ -239,7 +431,8 @@ class PersistentRuntime:
         """在独立节点对账已验证任务，恢复后始终先等待新的用户消息。
 
         Args:
-            values: 已核对身份与业务库的检查点输入。
+            values: 已核对身份与业务库的检查点输入；opening_id 在本次打开尝试内
+                固定，使节点重放复用同一档案事件，重新验证后的新尝试使用新标识。
 
         Returns:
             清除旧授权并核对后端结果的任务状态与空的本轮进度。
@@ -259,11 +452,12 @@ class PersistentRuntime:
         self.archive.append(
             self.thread_id,
             session.user_id,
-            f"{session.session_id}:opened",
+            f"{session.session_id}:opened:{values['opening_id']}",
             "event",
             {
                 "event": "session_opened",
                 "session_id": session.session_id,
+                "opening_id": values["opening_id"],
                 "checkpoint_turn": checkpoint_turn,
                 "message_turn": state.turn,
             },
