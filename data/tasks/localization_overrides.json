@@ -1,0 +1,245 @@
+{
+  "version": "ttwill-retail-localization-review-v1",
+  "entries": [
+    {
+      "canonical_task_id": "35",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        0,
+        "arguments",
+        "email"
+      ],
+      "source": "aarav.santos8321@example.com",
+      "native": "aarav.santos8321@example.com",
+      "reason": "原题故意给出的错误身份值，保留原值以维持首次查询失败；与官方68题保留错误邮编的口径一致。"
+    },
+    {
+      "canonical_task_id": "54",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        0,
+        "arguments",
+        "email"
+      ],
+      "source": "silva7872@example.com",
+      "native": "silva7872@example.com",
+      "reason": "原题故意给出的错误身份值，保留原值以维持首次查询失败；与官方68题保留错误邮编的口径一致。"
+    },
+    {
+      "canonical_task_id": "55",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        0,
+        "arguments",
+        "email"
+      ],
+      "source": "silva7872@example.com",
+      "native": "silva7872@example.com",
+      "reason": "原题故意给出的错误身份值，保留原值以维持首次查询失败；与官方68题保留错误邮编的口径一致。"
+    },
+    {
+      "canonical_task_id": "67",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        1,
+        "arguments",
+        "zip"
+      ],
+      "source": "98186",
+      "native": "98186",
+      "reason": "原题故意给出的错误身份值，保留原值以维持首次查询失败；与官方68题保留错误邮编的口径一致。"
+    },
+    {
+      "canonical_task_id": "33",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "known_info"
+      ],
+      "source": "You are an interesting guy called Noah Patel, living in the Big Apple in 10108.",
+      "native": "You are an interesting guy called 许浩然, living in 北京市 in 100020.",
+      "reason": "Big Apple 是原用户所在 New York 的别称；按该用户默认地址映射为北京市及对应邮编。"
+    },
+    {
+      "canonical_task_id": "34",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "known_info"
+      ],
+      "source": "You are an interesting guy called Noah Patel, living in the Big Apple in 10108.",
+      "native": "You are an interesting guy called 许浩然, living in 北京市 in 100020.",
+      "reason": "Big Apple 是原用户所在 New York 的别称；按该用户默认地址映射为北京市及对应邮编。"
+    },
+    {
+      "canonical_task_id": "34",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You had a work-from-home situation and ordered three home office items along with some hiking items, so that you can go back to your parent's place at Seattle to remote work and enjoy outdoor life. But your company just announced that you will be back to the office soon. If cancelling partial items is possible with the agent, you want to return the office items (your forgot what) and keep the hiking items. You want to know the total amount you will get back, and you want to get the refund on your original payment method. If cancelling partial items is not possible, just change the address to your NYC place and you will return the items later.",
+      "native": "You had a work-from-home situation and ordered three home office items along with some hiking items, so that you can go back to your parent's place at 大连市 to remote work and enjoy outdoor life. But your company just announced that you will be back to the office soon. If cancelling partial items is possible with the agent, you want to return the office items (your forgot what) and keep the hiking items. You want to know the total amount you will get back, and you want to get the refund on your original payment method. If cancelling partial items is not possible, just change the address to your 北京市 place and you will return the items later.",
+      "reason": "按该用户订单中的父母地址与默认地址，分别将 Seattle/NYC 对应到大连市/北京市。"
+    },
+    {
+      "canonical_task_id": "96",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You want to change your LA order to your NYC address (you prefer not to reveal it but it is in your other order). You also want to exchange Bluetooth Speaker to be the cheapest green type.",
+      "native": "You want to change your 上海市 order to your 北京市 address (you prefer not to reveal it but it is in your other order). You also want to exchange 蓝牙音箱 to be the cheapest green type.",
+      "reason": "LA/NYC 分别指该用户订单的 Los Angeles/New York 地址，映射后为上海市/北京市；保持原订单间迁移关系。"
+    },
+    {
+      "canonical_task_id": "111",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You want to modify the laptop order to your NYC address (you don't want to reveal it but should be in your orders profile). You also like to modify the laptop to be {'processor': 'i5', 'storage': '256GB SSD', 'color': 'space grey'};  You also want to exchange your watch to be black dial color but keep the leather strap.",
+      "native": "You want to modify the laptop order to your 北京市 address (you don't want to reveal it but should be in your orders profile). You also like to modify the laptop to be {'processor': 'i5', 'storage': '256GB SSD', 'color': 'space grey'};  You also want to exchange your watch to be black dial color but keep the leather strap.",
+      "reason": "NYC 指该用户已有订单中的 New York 地址，映射后为北京市。"
+    },
+    {
+      "canonical_task_id": "109",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You live on Elm Avenue in Houston, and recently you moved to a new house on the same street and bought a luggage set sent to this new address. But you realize you have another order sent to the old address, and you want to change your wrong order address to the new home, and also your user default address to the new home. You do not want to reveal your address but the agent should be able to look it up in orders You do not want to reveal your address and insist the agent should be able to look it up in orders. You also want to exchange your tablet to the cheapest one due to moving costs.",
+      "native": "You live on 解放碑步行街 in 重庆市, and recently you moved to a new house on the same street and bought a luggage set sent to this new address. But you realize you have another order sent to the old address, and you want to change your wrong order address to the new home, and also your user default address to the new home. You do not want to reveal your address but the agent should be able to look it up in orders You do not want to reveal your address and insist the agent should be able to look it up in orders. You also want to exchange your tablet to the cheapest one due to moving costs.",
+      "reason": "该用户两笔订单的 Elm Avenue 分别为 760/592 号，映射后仍同属重庆市解放碑步行街；保留同街新旧地址与各题不同迁移方向。"
+    },
+    {
+      "canonical_task_id": "110",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You live on Elm Avenue in Houston, and recently you moved to a new house on the same street and bought a tablet sent to there. But you realize you have another order sent to the old address, and you want to change your wrong order address to the new home, and also your user default address to the new home. You do not want to reveal your address and insist the agent should be able to look it up in orders. You also want to exchange your tablet to the cheapest one due to moving costs.",
+      "native": "You live on 解放碑步行街 in 重庆市, and recently you moved to a new house on the same street and bought a tablet sent to there. But you realize you have another order sent to the old address, and you want to change your wrong order address to the new home, and also your user default address to the new home. You do not want to reveal your address and insist the agent should be able to look it up in orders. You also want to exchange your tablet to the cheapest one due to moving costs.",
+      "reason": "该用户两笔订单的 Elm Avenue 分别为 760/592 号，映射后仍同属重庆市解放碑步行街；保留同街新旧地址与各题不同迁移方向。"
+    },
+    {
+      "canonical_task_id": "90",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You want to know if the digital camera you just bought is 10x zoom. If not, modify the item to 10x zoom without changing the other options. If 10x zoom is not available, cancel the order with the reason of no longer needed. If it is available but the price is more than 3000, cancel the order with the reason of ordered by mistake.",
+      "native": "You want to know if the digital camera you just bought is 10x zoom. If not, modify the item to 10x zoom without changing the other options. If 10x zoom is not available, cancel the order with the reason of no longer needed. If it is available but the price is more than CNY 21000, cancel the order with the reason of ordered by mistake.",
+      "reason": "3000 是省略货币符号的价格上限，须按官方固定 currency_scale=7 转为 CNY 21000；10x 变焦规格不缩放。"
+    },
+    {
+      "canonical_task_id": "72",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You made some mistake and sent an order your son's address in Washington DC, and you want to modify it to your default address in Charlotte instead (you do not want to mention it, but it is in your user profile the agent can look up) because he is coming back home. You also want to adjust the desk lamp to be black color, and the backpack to be medium size and polyester material instead. If multiple colors are available for the backpack, you prefer grey. If the agent asks for payment method, you say gift card initially, but when the agent asks you to confirm before proceeding, you change your mind to using PayPal, and also decide to only modify the backpack. Make sure you briefly mention the two things at the same time at the beginning, but first mention the modification then the address.",
+      "native": "You made some mistake and sent an order your son's address in 天津市, and you want to modify it to your default address in 青岛市 instead (you do not want to mention it, but it is in your user profile the agent can look up) because he is coming back home. You also want to adjust the desk lamp to be black color, and the backpack to be medium size and polyester material instead. If multiple colors are available for the backpack, you prefer grey. If the agent asks for payment method, you say gift card initially, but when the agent asks you to confirm before proceeding, you change your mind to using PayPal, and also decide to only modify the backpack. Make sure you briefly mention the two things at the same time at the beginning, but first mention the modification then the address.",
+      "reason": "Washington DC 是完整城市名称，按该用户订单地址映射为天津市；不分别替换城市与州缩写，不改变普通介词。"
+    },
+    {
+      "canonical_task_id": "87",
+      "path": [
+        "user_scenario",
+        "instructions",
+        "reason_for_call"
+      ],
+      "source": "You want to modify all your pending order address to the Washington DC address (which you do not want to reveal but is in one of the orders), along with your user default address.",
+      "native": "You want to modify all your pending order address to the 天津市 address (which you do not want to reveal but is in one of the orders), along with your user default address.",
+      "reason": "Washington DC 是完整城市名称，按该用户订单地址映射为天津市；不分别替换城市与州缩写，不改变普通介词。"
+    },
+    {
+      "canonical_task_id": "28",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        10,
+        "arguments",
+        "expression"
+      ],
+      "source": "200.8 + 96.35 + 193.38 + 231.37 + 196.53",
+      "native": "1405.60 + 674.45 + 1353.66 + 1619.59 + 1375.71",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    },
+    {
+      "canonical_task_id": "44",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        3,
+        "arguments",
+        "expression"
+      ],
+      "source": "135.24 - 153.23",
+      "native": "946.68 - 1072.61",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    },
+    {
+      "canonical_task_id": "45",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        3,
+        "arguments",
+        "expression"
+      ],
+      "source": "652.61 - 642.72",
+      "native": "4568.27 - 4499.04",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    },
+    {
+      "canonical_task_id": "46",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        4,
+        "arguments",
+        "expression"
+      ],
+      "source": "652.61 + 473.43",
+      "native": "4568.27 + 3314.01",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    },
+    {
+      "canonical_task_id": "46",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        6,
+        "arguments",
+        "expression"
+      ],
+      "source": "2623.69 - 1126.04",
+      "native": "18365.83 - 7882.28",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    },
+    {
+      "canonical_task_id": "61",
+      "path": [
+        "evaluation_criteria",
+        "actions",
+        3,
+        "arguments",
+        "expression"
+      ],
+      "source": "256.67 - 226.49",
+      "native": "1796.69 - 1585.43",
+      "reason": "原题计算退款、价差或订单剩余金额，各操作数均为美元金额，按官方固定七倍换算为人民币；保持加减运算与顺序。"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-"""提供本体演示、业务操作、离线重放、单题评测和轨迹查看。"""
+"""提供本体演示、业务操作、任务转换、离线重放、模型评测和轨迹查看。"""
 
 import argparse
 import asyncio
@@ -215,10 +215,26 @@ def main() -> None:
     _business_parser(subparsers)
     bench = subparsers.add_parser("bench", help="离线参考动作重放，需要 bench 可选依赖")
     bench.add_argument("--source", type=Path, default=Path("data/source"))
+    bench.add_argument("--tasks", type=Path, default=Path("data/tasks"))
+    bench.add_argument(
+        "--dataset", choices=["retail_50", "dev_64", "dev_quick"], default="retail_50"
+    )
     bench.add_argument("--output", type=Path, required=True, help="新的重放产物目录")
+    convert = subparsers.add_parser("convert-tasks", help="离线转换开发题并校验官方 50 题")
+    convert.add_argument("--source", type=Path, default=Path("data/source"))
+    convert.add_argument("--output", type=Path, default=Path("data/tasks"))
+    quick = subparsers.add_parser(
+        "freeze-quick-set", help="按固定种子生成开发快速集，不覆盖已有清单"
+    )
+    quick.add_argument("--tasks", type=Path, default=Path("data/tasks"))
+    quick.add_argument("--seed", type=int, default=0)
+    quick.add_argument("--size", type=int, default=20)
     evaluate = subparsers.add_parser("evaluate", help="运行一题官方用户模拟与终态判分")
     evaluate.add_argument("--config", type=Path, default=Path("config.toml"))
-    evaluate.add_argument("--task-id", required=True, help="固定中文 retail_50 的题目标识")
+    evaluate.add_argument("--task-id", required=True, help="所选固定任务集中的题目标识")
+    evaluate.add_argument(
+        "--dataset", choices=["retail_50", "dev_64", "dev_quick"], default="retail_50"
+    )
     evaluate.add_argument("--output", type=Path, required=True, help="尚不存在的尝试目录")
     evaluate.add_argument("--user-tier", default="user_simulator")
     evaluate.add_argument("--judge-tier", default="evaluator")
@@ -226,6 +242,15 @@ def main() -> None:
     evaluate.add_argument("--repeat", type=int, default=1)
     evaluate.add_argument("--max-steps", type=int, default=100)
     evaluate.add_argument("--timeout-seconds", type=float, default=600)
+    batch = subparsers.add_parser("evaluate-batch", help="按固定开发清单逐题运行 D 组并汇总")
+    batch.add_argument("--config", type=Path, default=Path("config.toml"))
+    batch.add_argument("--dataset", choices=["dev_64", "dev_quick"], default="dev_quick")
+    batch.add_argument("--output", type=Path, required=True, help="尚不存在的批量运行目录")
+    batch.add_argument("--user-tier", default="user_simulator")
+    batch.add_argument("--judge-tier", default="evaluator")
+    batch.add_argument("--seed", type=int, default=0)
+    batch.add_argument("--max-steps", type=int, default=100)
+    batch.add_argument("--timeout-seconds", type=float, default=600)
     args = parser.parse_args()
     try:
         if args.command == "demo":
@@ -252,6 +277,34 @@ def main() -> None:
             print(render_tree(args.path))
         elif args.command == "business":
             print(json.dumps(run_business(args), ensure_ascii=False, indent=2))
+        elif args.command == "convert-tasks":
+            from ttwill.bench.conversion import build_development_tasks
+
+            report = build_development_tasks(args.source, args.output)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif args.command == "freeze-quick-set":
+            from ttwill.bench.tasks import generate_quick_set
+
+            report = generate_quick_set(args.tasks, seed=args.seed, size=args.size)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        elif args.command == "evaluate-batch":
+            from ttwill.bench.batch import run_batch
+
+            report = run_batch(
+                args.config,
+                args.output,
+                dataset=args.dataset,
+                user_tier=args.user_tier,
+                judge_tier=args.judge_tier,
+                seed=args.seed,
+                max_steps=args.max_steps,
+                timeout_seconds=args.timeout_seconds,
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if report["completion_rate"] < 1:
+                raise SystemExit(2)
+            if report["task_success_rate"] < 1:
+                raise SystemExit(1)
         elif args.command == "evaluate":
             from openai import APIError
 
@@ -270,6 +323,7 @@ def main() -> None:
                     repeat=args.repeat,
                     max_steps=args.max_steps,
                     timeout_seconds=args.timeout_seconds,
+                    **({"dataset": args.dataset} if args.dataset != "retail_50" else {}),
                 )
             except (APIError, LLMError, EvaluationIncompleteError, TimeoutError) as exc:
                 parser.exit(
@@ -281,10 +335,12 @@ def main() -> None:
             if not report["task_success"]:
                 raise SystemExit(1)
         else:
-            from ttwill.bench.replay import replay_retail_50
-            from ttwill.bench.retail import load_retail_bundle
+            from ttwill.bench.replay import replay_tasks
+            from ttwill.bench.tasks import load_task_bundle
 
-            report = replay_retail_50(load_retail_bundle(args.source), args.output)
+            report = replay_tasks(
+                load_task_bundle(args.source, args.tasks, args.dataset), args.output
+            )
             print(
                 json.dumps(
                     {

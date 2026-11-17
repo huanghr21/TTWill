@@ -1,0 +1,205 @@
+{
+  "name": "dev_quick",
+  "source_dataset": "dev_64",
+  "source_sha256": "cdf50f477e28773067dac5d64645116c13e5c34a93462f9fd67e7e35b241bd2b",
+  "algorithm": "write-type-count-sha256-v1",
+  "seed": 0,
+  "size": 20,
+  "stratifier": {
+    "write_type": "单一写工具名；多种写工具为 mixed；无写工具为 read_only",
+    "write_count": [
+      "0",
+      "1",
+      "2",
+      "3+"
+    ],
+    "allocation": "每层先取 1 题；余量按各层剩余容量比例，以最大余数法分配",
+    "selection": "按 SHA256(seed:层名:任务ID) 排序；配额平局按 SHA256(seed:层名)"
+  },
+  "population_coverage": {
+    "write_tools": [
+      "cancel_pending_order",
+      "exchange_delivered_order_items",
+      "modify_pending_order_address",
+      "modify_pending_order_items",
+      "modify_user_address",
+      "return_delivered_order_items"
+    ],
+    "missing_write_tools": [
+      "modify_pending_order_payment"
+    ],
+    "read_only_tasks": 6,
+    "multi_write_tasks": 25,
+    "write_count_distribution": {
+      "0": 6,
+      "1": 33,
+      "2": 14,
+      "3": 7,
+      "4": 4
+    }
+  },
+  "selected_coverage": {
+    "write_tools": [
+      "cancel_pending_order",
+      "exchange_delivered_order_items",
+      "modify_pending_order_address",
+      "modify_pending_order_items",
+      "modify_user_address",
+      "return_delivered_order_items"
+    ],
+    "missing_write_tools": [
+      "modify_pending_order_payment"
+    ],
+    "read_only_tasks": 2,
+    "multi_write_tasks": 9,
+    "write_count_distribution": {
+      "0": 2,
+      "1": 9,
+      "2": 6,
+      "3": 2,
+      "4": 1
+    }
+  },
+  "strata": [
+    {
+      "key": "cancel_pending_order:1",
+      "population": 3,
+      "selected": 1,
+      "task_ids": [
+        "88_zh_identity"
+      ]
+    },
+    {
+      "key": "cancel_pending_order:2",
+      "population": 3,
+      "selected": 1,
+      "task_ids": [
+        "76_zh_identity"
+      ]
+    },
+    {
+      "key": "exchange_delivered_order_items:1",
+      "population": 11,
+      "selected": 2,
+      "task_ids": [
+        "9_zh_identity",
+        "77_zh_identity"
+      ]
+    },
+    {
+      "key": "exchange_delivered_order_items:2",
+      "population": 3,
+      "selected": 1,
+      "task_ids": [
+        "95_zh_identity"
+      ]
+    },
+    {
+      "key": "mixed:2",
+      "population": 6,
+      "selected": 2,
+      "task_ids": [
+        "96_zh_identity",
+        "31_zh_identity"
+      ]
+    },
+    {
+      "key": "mixed:3+",
+      "population": 10,
+      "selected": 2,
+      "task_ids": [
+        "101_zh_identity",
+        "87_zh_identity"
+      ]
+    },
+    {
+      "key": "modify_pending_order_address:1",
+      "population": 1,
+      "selected": 1,
+      "task_ids": [
+        "34_zh_identity"
+      ]
+    },
+    {
+      "key": "modify_pending_order_items:1",
+      "population": 7,
+      "selected": 2,
+      "task_ids": [
+        "3_zh_identity",
+        "60_zh_identity"
+      ]
+    },
+    {
+      "key": "modify_pending_order_items:2",
+      "population": 1,
+      "selected": 1,
+      "task_ids": [
+        "4_zh_identity"
+      ]
+    },
+    {
+      "key": "modify_user_address:1",
+      "population": 2,
+      "selected": 1,
+      "task_ids": [
+        "33_zh_identity"
+      ]
+    },
+    {
+      "key": "read_only:0",
+      "population": 6,
+      "selected": 2,
+      "task_ids": [
+        "57_zh_identity",
+        "24_zh_identity"
+      ]
+    },
+    {
+      "key": "return_delivered_order_items:1",
+      "population": 9,
+      "selected": 2,
+      "task_ids": [
+        "48_zh_identity",
+        "82_zh_identity"
+      ]
+    },
+    {
+      "key": "return_delivered_order_items:2",
+      "population": 1,
+      "selected": 1,
+      "task_ids": [
+        "92_zh_identity"
+      ]
+    },
+    {
+      "key": "return_delivered_order_items:3+",
+      "population": 1,
+      "selected": 1,
+      "task_ids": [
+        "28_zh_identity"
+      ]
+    }
+  ],
+  "task_ids": [
+    "88_zh_identity",
+    "76_zh_identity",
+    "9_zh_identity",
+    "77_zh_identity",
+    "95_zh_identity",
+    "96_zh_identity",
+    "31_zh_identity",
+    "101_zh_identity",
+    "87_zh_identity",
+    "34_zh_identity",
+    "3_zh_identity",
+    "60_zh_identity",
+    "4_zh_identity",
+    "33_zh_identity",
+    "57_zh_identity",
+    "24_zh_identity",
+    "48_zh_identity",
+    "82_zh_identity",
+    "92_zh_identity",
+    "28_zh_identity"
+  ]
+}

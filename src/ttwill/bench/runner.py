@@ -208,32 +208,37 @@ def run_single(
     task_id: str,
     output: Path,
     *,
+    dataset: str = "retail_50",
     user_tier: str = "user_simulator",
     judge_tier: str = "evaluator",
     seed: int = 0,
     repeat: int = 1,
     max_steps: int = 100,
     timeout_seconds: float = 600,
+    expected: dict | None = None,
 ) -> dict:
     """运行一题 D 组对话并判分，每次调用创建新的尝试目录。
 
     Args:
         config_path: 配置路径；flash、摘要、模拟用户、判分档位都须可实际调用。
-        task_id: 固定 retail_50 中的题目标识，不据答案筛选任务。
+        task_id: 指定固定任务集中的题目标识，不据答案筛选任务。
         output: 尚不存在的尝试目录，保留输入、对话、终态、判分和费用。
+        dataset: 固定任务集，支持 retail_50、dev_64 和 dev_quick。
         user_tier: 官方模拟用户使用的模型档位。
         judge_tier: 自然语言断言判分使用的模型档位。
         seed: 官方对话和 persona 分配使用的随机种子。
         repeat: 实验重复序号，从 1 开始；补跑使用同序号及新目录。
         max_steps: 官方对话调度步数上限，用户和助手各算一步。
         timeout_seconds: 官方调度器在步骤之间检查的总时限，单位为秒。
+        expected: 批次计划中的 dataset、config、source 和 provenance 快照；
+            为 None 时独立运行，否则在读取凭据前检查本题来源和配置是否仍一致。
 
     Returns:
         包含完成状态、独立数据库一致性和完整任务成功判定的报告。
 
     Raises:
         ConfigError: 模型配置或本地密钥不完整。
-        ValueError: 题目、来源提交或运行参数无效。
+        ValueError: 题目、来源提交或运行参数无效，或批次期间配置、来源、代码发生变化。
         FileExistsError: 输出目录已经存在。
         OSError: 资源读取或产物写入失败。
         LLMError: 本体模型调用失败；产物保留为未完成尝试。
@@ -249,28 +254,46 @@ def run_single(
     if type(seed) is not int:
         raise ValueError("seed 必须是整数")
     config = load_config(config_path)
-    bundle = load_retail_bundle(config.root / "data" / "source")
+    if dataset == "retail_50":
+        bundle = load_retail_bundle(config.root / "data" / "source")
+    else:
+        from ttwill.bench.tasks import load_task_bundle
+
+        bundle = load_task_bundle(
+            config.root / "data" / "source", config.root / "data" / "tasks", dataset
+        )
     raw_task = next((item for item in bundle.tasks if item["id"] == task_id), None)
     if raw_task is None:
-        raise ValueError("task_id 不在固定 retail_50 中")
+        raise ValueError(f"task_id 不在固定任务集 {dataset} 中")
     task = Task.model_validate(raw_task)
     if task.initial_state is not None:
-        raise ValueError("当前单题入口只支持 initial_state 为 None 的 retail_50")
+        raise ValueError("当前单题入口只支持 initial_state 为 None 的任务")
     required_tiers = {"flash", config.context.summary_tier, user_tier, judge_tier}
     if missing := required_tiers - config.models.keys():
         raise ConfigError(f"评测缺少模型档位：{', '.join(sorted(missing))}")
-    args_by_tier = {tier: _model_args(config, config.models[tier]) for tier in required_tiers}
     provenance = _provenance(config, bundle)
+    public_config = asdict(config)
+    public_config.update(root=str(config.root), runs_dir=str(config.runs_dir))
+    if expected is not None and (
+        expected["dataset"] != dataset
+        or expected["config"] != public_config
+        or expected["source"] != bundle.manifest
+        or any(
+            expected["provenance"][key] != provenance[key]
+            for key in ("tau2_commit", "git_head", "sha256")
+        )
+    ):
+        raise ValueError("批次配置、来源或代码已变化，停止本次运行")
+    args_by_tier = {tier: _model_args(config, config.models[tier]) for tier in required_tiers}
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     run_id, attempt_id = uuid4().hex, uuid4().hex
     trace = Trace(
         output, uuid4().hex, run_id=run_id, task_id=task_id, repeat=repeat, attempt_id=attempt_id
     )
-    public_config = asdict(config)
-    public_config.update(root=str(config.root), runs_dir=str(config.runs_dir))
     metadata = {
         "group": "D",
+        "dataset": dataset,
         "run_id": run_id,
         "attempt_id": attempt_id,
         "task_id": task_id,
@@ -289,7 +312,14 @@ def run_single(
     _write_json(output / "metadata.json", metadata)
     _write_json(output / "task.json", raw_task)
     _write_json(output / "initial_database.json", bundle.database)
-    report = {"task_id": task_id, "attempt_id": attempt_id, "completed": False}
+    report = {
+        "dataset": dataset,
+        "run_id": run_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "repeat": repeat,
+        "completed": False,
+    }
     orchestrator = None
     token = llm_log_dir.set(None)
     try:

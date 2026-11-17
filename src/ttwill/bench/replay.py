@@ -334,11 +334,11 @@ def compare_read_tools(bundle: RetailBundle, database_path: Path) -> list[dict[s
         backend.close()
 
 
-def replay_retail_50(bundle: RetailBundle, output_dir: Path) -> dict[str, Any]:
+def replay_tasks(bundle: RetailBundle, output_dir: Path) -> dict[str, Any]:
     """执行无模型一致性校验，并保存各题数据库与原始报告。
 
     Args:
-        bundle: 来自固定提交的官方中文 retail_50 数据包。
+        bundle: 来自固定提交的中文数据包，任务可为官方 50 题或已校验的开发题。
         output_dir: 本次运行的新目录，保存各题数据库、读工具校验库及 report.json。
 
     Returns:
