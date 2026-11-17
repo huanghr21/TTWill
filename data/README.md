@@ -7,12 +7,19 @@
 | --- | --- | --- |
 | `tau2_zh_retail.json` | `data/tau2/multilingual/zh/regional/retail.json` | 500 用户、1000 订单、50 类商品及 591 个规格；官方中文 50 题、政策与本地化元数据 |
 | `retail_50.json` | `data/tau2/task_subsets/retail_50.json` | 冻结任务 ID 清单 |
+| `tau2_zh_pack.yaml` | `data/tau2/multilingual/zh/pack.yaml` | 官方中文人设、语言要求及文字对话开场白 |
 | `LICENSE.tau2` | `LICENSE` | 上游 MIT 许可证 |
 | `manifest.json` | 本项目生成 | 来源提交、转换版本、各文件 SHA-256 及字节数 |
 
-三份上游文件原样复制；导入前由 `ttwill.bench.retail.load_retail_bundle` 校验内容哈希和任务集合。
+四份上游文件原样复制；导入前由 `ttwill.bench.retail.load_retail_bundle` 校验内容哈希和任务集合。
 数据中的人物、地址和联系方式是基准合成数据。中文包金额使用上游固定的人民币换算，
 没有实时汇率请求。
+
+语言包用于第 7 步官方用户模拟器。文字对话只读取包内的中文人设、零售文字说明和开场白，
+人设选择复用官方按任务元信息与种子分配的规则；零售任务元信息已完整包含在
+`tau2_zh_retail.json` 中，与上游 `retail_metadata_zh.json` 一致。语言包内其他领域和语音
+资源引用不在本步加载，不另复制无关任务、语音或本地化映射文件。所有复制内容适用
+已保存的上游 MIT 许可证，语言包与原有数据库来自同一提交。
 
 重新取得同一份文件时，克隆
 [上游仓库](https://github.com/sierra-research/tau2-bench)，检出上述提交后复制表中路径；
