@@ -21,8 +21,12 @@ max_retries = 2
 retry_delay_seconds = 0.5
 
 [models.flash]
-model = "fake-demo"
-# 仅用于假模型演示，不能作为真实服务的价格。
-input_cost_per_million = 0.0
-output_cost_per_million = 0.0
-cached_input_cost_per_million = 0.0
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+api_key_env = "TTWILL_API_KEY"
+# 官方按高峰 / 低峰时段计费，暂不写静态单价；保存用量，费用记为未知。
+# https://api-docs.deepseek.com/quick_start/pricing/
+
+[models.flash.parameters]
+# 固定官方默认思考强度，三个评测角色共用此档位。
+reasoning_effort = "high"

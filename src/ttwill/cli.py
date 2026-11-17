@@ -9,11 +9,11 @@ from uuid import uuid4
 from ttwill.backend import BusinessError, RetailBackend
 from ttwill.bootstrap import (
     business_runtime,
+    load_demo_config,
     run_agent_demo,
     run_coordinator_demo,
     run_runtime_demo,
 )
-from ttwill.config import load_config
 from ttwill.gateway import AFTER_SALES_WRITES, READ_TOOLS, WRITE_TOOLS, CallContext
 from ttwill.llm import FakeModel, LLMClient
 from ttwill.tracing import Trace, render_tree
@@ -33,7 +33,7 @@ async def run_demo(config_path: Path) -> Path:
         ValueError: 未配置 flash 档位。
         OSError: 配置无法读取，或运行记录无法写入。
     """
-    config = load_config(config_path)
+    config = load_demo_config(config_path)
     run_id = f"demo-{uuid4().hex}"
     session_id = uuid4().hex
     trace = Trace(config.runs_dir / run_id, session_id, run_id=run_id)

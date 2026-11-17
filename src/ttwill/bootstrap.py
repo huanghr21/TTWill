@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,7 +11,7 @@ from ttwill.agents.retail import build_registry
 from ttwill.backend import RetailBackend
 from ttwill.bench.policy import extract_policy
 from ttwill.bench.retail import load_retail_bundle
-from ttwill.config import load_config
+from ttwill.config import AppConfig, ModelConfig, load_config
 from ttwill.core.context import ContextCompiler
 from ttwill.core.coordinator import ConversationState, Coordinator
 from ttwill.core.runtime import PersistentRuntime
@@ -21,6 +22,35 @@ from ttwill.llm import FakeModel, LLMClient
 from ttwill.persistence import Archive
 from ttwill.persistence.checkpoints import open_checkpointer
 from ttwill.tracing import Trace
+
+
+def load_demo_config(config_path: Path) -> AppConfig:
+    """为假模型演示复制运行配置，将各模型档位绑定为零费用的 fake-demo。
+
+    Args:
+        config_path: 用户运行配置路径；仅复用目录、超时、业务与上下文预算等设置。
+
+    Returns:
+        模型名称及价格已隔离的配置副本，不含真实服务地址或密钥变量名。
+        原配置文件保持不变，真实运行入口仍直接使用 load_config。
+
+    Raises:
+        ConfigError: 原运行配置字段缺失或取值无效。
+        OSError: 配置文件无法读取。
+    """
+    config = load_config(config_path)
+    return replace(
+        config,
+        models={
+            tier: ModelConfig(
+                "fake-demo",
+                input_cost_per_million=0,
+                output_cost_per_million=0,
+                cached_input_cost_per_million=0,
+            )
+            for tier in config.models
+        },
+    )
 
 
 def load_skills(root: Path) -> SkillCatalog:
@@ -132,7 +162,7 @@ async def run_coordinator_demo(config_path: Path) -> dict:
         LLMError: 假模型响应脚本已耗尽，或响应结构不合格。
         OSError: 资源无法读取，或业务库、运行记录无法写入。
     """
-    config = load_config(config_path)
+    config = load_demo_config(config_path)
     bundle = load_retail_bundle(config.root / "data" / "source")
     skills = load_skills(config.root)
     order = next(
@@ -201,7 +231,7 @@ async def run_agent_demo(config_path: Path, capability: str) -> dict:
     """
     if capability not in {"order_service", "after_sales"}:
         raise ValueError(f"未知演示能力：{capability}")
-    config = load_config(config_path)
+    config = load_demo_config(config_path)
     bundle = load_retail_bundle(config.root / "data" / "source")
     skills = load_skills(config.root)
     desired_status = "pending" if capability == "order_service" else "delivered"
@@ -304,7 +334,7 @@ async def run_runtime_demo(config_path: Path) -> dict:
         LLMError: 假模型响应脚本耗尽或返回格式不合法。
         OSError: 资源无法读取，或业务库、检查点、档案、轨迹无法写入。
     """
-    config = load_config(config_path)
+    config = load_demo_config(config_path)
     bundle = load_retail_bundle(config.root / "data" / "source")
     skills = load_skills(config.root)
     order = next(
