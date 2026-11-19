@@ -146,8 +146,15 @@ def _model_args(config: AppConfig, model: ModelConfig) -> dict:
     }
     if reserved & model.parameters.keys():
         raise ConfigError("评测模型 parameters 不能覆盖接口、回调、缓存或重试设置")
+    parameters = dict(model.parameters)
+    if "thinking" in parameters:
+        # OpenAI 兼容入口会把顶层 thinking 当作不支持的 Anthropic 参数丢弃。
+        parameters["extra_body"] = {
+            **parameters.get("extra_body", {}),
+            "thinking": parameters.pop("thinking"),
+        }
     return {
-        **model.parameters,
+        **parameters,
         "api_base": model.base_url,
         "api_key": key,
         "timeout": config.llm.timeout_seconds,

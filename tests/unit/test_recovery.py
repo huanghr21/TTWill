@@ -17,7 +17,7 @@ from ttwill.gateway.skills import SkillCatalog
 from ttwill.tracing import Trace
 
 ACTION = "cancel_pending_order"
-ARGS = {"order_id": "#1", "reason": "no longer needed"}
+ARGS = {"order_id": "#W0000001", "reason": "no longer needed"}
 
 
 @pytest.fixture
@@ -52,7 +52,12 @@ def state(gateway: ToolGateway) -> ConversationState:
         {"email": "u1@example.com"},
     )
     result.tasks.tasks["task-1"] = Task(
-        "task-1", "order_service", ACTION, "取消订单 #1", order_id="#1", status="running"
+        "task-1",
+        "order_service",
+        ACTION,
+        "取消订单 #W0000001",
+        order_id="#W0000001",
+        status="running",
     )
     result.last_display = [{"session_id": "old-chat", "content": "请确认取消订单"}]
     return result
@@ -142,7 +147,7 @@ def test_committed_before_checkpoint_is_verified_without_second_refund(
     assert task.facts[-1]["verification"]["verified"] is True
     assert len(task.facts) == 1
     assert gateway.backend.export_snapshot() == before
-    history = before["orders"]["#1"]["payment_history"]
+    history = before["orders"]["#W0000001"]["payment_history"]
     assert [item["transaction_type"] for item in history] == ["payment", "refund"]
     assert not any(record["kind"] == "commit" for record in gateway.records)
 
@@ -154,9 +159,11 @@ def test_committed_record_requires_current_business_verification(
     operation = prepare(gateway, state)
     gateway.backend.commit("u1", operation["operation_id"], ARGS)
     with gateway.backend.engine.begin() as connection:
-        entity = connection.execute(select(orders.c.data).where(orders.c.id == "#1")).scalar_one()
+        entity = connection.execute(
+            select(orders.c.data).where(orders.c.id == "#W0000001")
+        ).scalar_one()
         entity["status"] = "pending"
-        connection.execute(update(orders).where(orders.c.id == "#1").values(data=entity))
+        connection.execute(update(orders).where(orders.c.id == "#W0000001").values(data=entity))
     recover(state, gateway)
     task = state.tasks.tasks["task-1"]
     assert task.status == "failed"
@@ -293,7 +300,7 @@ def test_wrong_order_prepare_is_rejected_instead_of_becoming_confirmable(
     gateway: ToolGateway, state: ConversationState
 ) -> None:
     """即使关联请求正确，准备了错误订单也必须失败并释放占用。"""
-    operation = prepare(gateway, state, order_id="#4")
+    operation = prepare(gateway, state, order_id="#W0000004")
     recover(state, gateway)
     task = state.tasks.tasks["task-1"]
     assert task.status == "failed"

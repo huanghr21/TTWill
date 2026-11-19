@@ -58,7 +58,7 @@ def test_model_selects_gateway_tools_through_compatible_transport(
             args = {"name": skill_catalog.required_skill("cancel_pending_order")}
         else:
             selected = available["cancel_pending_order"]
-            args = {"order_id": "#1", "reason": "no longer needed"}
+            args = {"order_id": "#W0000001", "reason": "no longer needed"}
         assert set(selected["parameters"]["required"]) == set(args)
         return httpx.Response(
             200,
@@ -98,7 +98,9 @@ def test_model_selects_gateway_tools_through_compatible_transport(
             CallContext(session, "order_service", "instance-1", "task-1"),
             CallContext(session, "order_service", "instance-1", "task-1"),
         ]
-        messages = [{"role": "user", "content": "我的邮箱是 u1@example.com，请取消订单 #1。"}]
+        messages = [
+            {"role": "user", "content": "我的邮箱是 u1@example.com，请取消订单 #W0000001。"}
+        ]
         async with CompatibleModel(
             env_path, transport=httpx.MockTransport(choose_tool)
         ) as transport:
@@ -125,5 +127,7 @@ def test_model_selects_gateway_tools_through_compatible_transport(
     assert requests[1]["tools"] == requests[2]["tools"]
     assert prepared["status"] == "prepared"
     assert prepared["preview"]["status"] == "cancelled"
-    assert backend.query("u1", "get_order_details", {"order_id": "#1"})["status"] == "pending"
+    assert (
+        backend.query("u1", "get_order_details", {"order_id": "#W0000001"})["status"] == "pending"
+    )
     assert gateway.records[-1]["result"] == prepared

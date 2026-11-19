@@ -25,17 +25,17 @@ def cancel_task() -> Task:
     """构造具有真实官方取消参考动作的零售任务。
 
     Returns:
-        目标为取消 #1 订单、按数据库终态与可选自然语言断言判分的任务。
+        目标为取消 #W0000001 订单、按数据库终态与可选自然语言断言判分的任务。
     """
     return Task(
         id="cancel-small-order",
-        user_scenario={"instructions": "取消 #1 订单。"},
+        user_scenario={"instructions": "取消 #W0000001 订单。"},
         evaluation_criteria=EvaluationCriteria(
             actions=[
                 Action(
                     action_id="cancel",
                     name="cancel_pending_order",
-                    arguments={"order_id": "#1", "reason": "no longer needed"},
+                    arguments={"order_id": "#W0000001", "reason": "no longer needed"},
                 )
             ],
             reward_basis=["DB", "NL_ASSERTION"],
@@ -52,7 +52,7 @@ def cancel_order(backend: RetailBackend) -> dict:
     Returns:
         已包含退款历史的取消终态。
     """
-    args = {"order_id": "#1", "reason": "no longer needed"}
+    args = {"order_id": "#W0000001", "reason": "no longer needed"}
     prepared = backend.prepare("u1", "cancel_pending_order", args, "evaluation-cancel")
     backend.commit("u1", prepared["operation_id"], args)
     return backend.export_snapshot()
@@ -128,7 +128,7 @@ def test_predicted_trajectory_is_never_replayed(
                     ToolCall(
                         id="unexpected",
                         name="cancel_pending_order",
-                        arguments={"order_id": "#4", "reason": "no longer needed"},
+                        arguments={"order_id": "#W0000004", "reason": "no longer needed"},
                     )
                 ],
             )

@@ -28,5 +28,5 @@ api_key_env = "TTWILL_API_KEY"
 # https://api-docs.deepseek.com/quick_start/pricing/
 
 [models.flash.parameters]
-# 固定官方默认思考强度，三个评测角色共用此档位。
-reasoning_effort = "high"
+# 关闭思考模式，本体、模拟用户、判分与摘要共用此档位。
+thinking = { type = "disabled" }

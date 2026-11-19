@@ -14,6 +14,7 @@ from langgraph.types import Command, interrupt
 from ttwill.core.context import ContextBudgetExceeded, ContextCompiler, context_chars
 from ttwill.core.coordinator import ConversationState, Coordinator, TurnState
 from ttwill.core.recovery import reconcile_restored_tasks
+from ttwill.core.task_view import task_view
 from ttwill.core.tasks import Task
 from ttwill.gateway import IDENTITY_TOOLS, BusinessError, CallContext, SessionContext
 from ttwill.llm import LLMError
@@ -193,17 +194,15 @@ class PersistentRuntime:
                     work = self.coordinator.begin_turn(state, user_message)
                     self._intake_turns.append(work)
                     while work.result is None:
-                        context = CallContext(state.session, "coordinator", work.instance_id)
-                        tools = self.coordinator._schemas(context, work.confirmed)
-                        if context_chars(work.messages, tools) > self.compiler.max_chars:
+                        tools = self.coordinator._schemas(state, work)
+                        messages = self.coordinator._model_messages(state, work)
+                        if context_chars(messages, tools) > self.compiler.max_chars:
                             self.coordinator.stop_turn(
                                 state, work, "身份验证前的对话超过上下文字符预算，请重新开始会话"
                             )
                         else:
                             try:
-                                await self.coordinator.advance_turn(
-                                    state, work, messages=work.messages
-                                )
+                                await self.coordinator.advance_turn(state, work, messages=messages)
                             except (asyncio.CancelledError, OSError):
                                 self._intake = ConversationState(SessionContext(trace.session_id))
                                 self._intake_turns = []
@@ -509,7 +508,6 @@ class PersistentRuntime:
         state = _conversation(values["conversation"], self._require_session())
         self._state = state
         work = TurnState(**deepcopy(values["work"]))
-        context = CallContext(state.session, "coordinator", work.instance_id)
         offset = len(work.messages)
         invalid_offset = len(work.invalid_outputs)
         try:
@@ -518,10 +516,13 @@ class PersistentRuntime:
                     thread_id=self.thread_id,
                     owner_id=state.session.user_id,
                     system_messages=work.messages[:1],
-                    task_snapshot={"tasks": state.tasks.snapshot(), "verified": True},
+                    task_snapshot={
+                        "tasks": [task_view(task) for task in state.tasks.snapshot()],
+                        "verified": True,
+                    },
                     current_message=work.user_message,
                     current_turn=state.turn,
-                    tools=self.coordinator._schemas(context, work.confirmed),
+                    tools=self.coordinator._schemas(state, work),
                     current_messages=work.messages[work.base_messages :],
                 )
             except (ContextBudgetExceeded, LLMError, TimeoutError) as exc:

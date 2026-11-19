@@ -1,6 +1,7 @@
 """将已核对的业务操作转换成用户可确认的中文详情。"""
 
 import json
+from collections import defaultdict, deque
 from typing import Any
 
 _ACTION_LABELS = {
@@ -36,6 +37,9 @@ _FIELD_LABELS = {
     "zip": "邮政编码",
     "status": "订单状态",
     "items": "订单商品",
+    "item_changes": "本次商品变更",
+    "original_item": "原商品",
+    "replacement_item": "新规格",
     "name": "商品名称",
     "product_id": "商品编号",
     "item_id": "商品规格编号",
@@ -66,7 +70,7 @@ _REASON_LABELS = {
 _PREVIEW_FIELDS = {
     "cancel_pending_order": ("status", "cancel_reason", "payment_history"),
     "modify_pending_order_address": ("status", "address"),
-    "modify_pending_order_items": ("status", "items", "payment_history"),
+    "modify_pending_order_items": ("status", "item_changes", "payment_history"),
     "modify_pending_order_payment": ("status", "payment_history"),
     "modify_user_address": ("address",),
     "return_delivered_order_items": (
@@ -100,29 +104,68 @@ def action_label(action: str) -> str:
     return _ACTION_LABELS.get(action, action)
 
 
-def operation_content(operation: dict) -> str:
+def operation_content(operation: dict, *, original_items: list[dict] | None = None) -> str:
     """展示完整办理参数与对应预期结果，不将准备预览表述为已经完成。
 
     Args:
         operation: 已核对身份、参数和状态的后端准备记录，包含 action、args
             与 preview。金额、商品及支付方式标识保留原值；用户身份参数以
             当前账户表达，不展示内部用户标识或准备记录的关联标识。
+        original_items: 修改待发货商品时所需的原订单条目，由网关读取当前
+            未提交订单提供；其他动作不需要传入。
 
     Returns:
         包含中文动作、办理对象、完整参数与动作相关预期结果的展示文本。
-        用户地址操作仅展示地址预期结果，其他账户资料不进入正文。
+        商品修改仅列出逐项原商品与新规格，其他订单商品不进入正文；用户
+        地址操作仅展示地址预期结果，其他账户资料不进入正文。
+
+    Raises:
+        ValueError: 修改商品时未提供原始条目，或原条目与准备预览无法按请求配对。
     """
     action = operation["action"]
     arguments = operation["args"]
     preview = operation["preview"]
     target = f"订单：{arguments['order_id']}" if "order_id" in arguments else "账户：当前账户"
     fields = _PREVIEW_FIELDS.get(action, ())
+    if action == "modify_pending_order_items":
+        if original_items is None:
+            raise ValueError("修改商品展示需要原始订单商品")
+        preview = {**preview, "item_changes": _item_changes(arguments, original_items, preview)}
     expected = {key: preview[key] for key in fields if key in preview}
     return (
         f"待确认：{action_label(action)}\n{target}\n\n"
         f"办理内容：\n{json.dumps(_translate(arguments), ensure_ascii=False, indent=2)}\n\n"
         f"确认后预期结果：\n{json.dumps(_translate(expected), ensure_ascii=False, indent=2)}"
     )
+
+
+def _item_changes(arguments: dict, original_items: list[dict], preview: dict) -> list[dict]:
+    """按请求顺序配对原条目与预览中相同位置的新规格，保留重复规格的成交价。
+
+    Args:
+        arguments: 后端保存的修改参数，item_ids 与 new_item_ids 一一对应。
+        original_items: 未提交订单的完整商品条目，顺序与后端准备时一致。
+        preview: 后端的完整修改预览，商品替换保持原订单条目位置。
+
+    Returns:
+        每项含 original_item 与 replacement_item，仅覆盖请求修改的条目。
+
+    Raises:
+        ValueError: 原条目或修改后预览不匹配准备请求。
+    """
+    positions = defaultdict(deque)
+    for index, item in enumerate(original_items):
+        positions[item["item_id"]].append(index)
+    changes = []
+    for old_id, new_id in zip(arguments["item_ids"], arguments["new_item_ids"], strict=True):
+        if not positions[old_id]:
+            raise ValueError("原始订单商品与准备参数不一致")
+        index = positions[old_id].popleft()
+        replacement = preview["items"][index]
+        if replacement["item_id"] != new_id:
+            raise ValueError("修改后商品与准备参数不一致")
+        changes.append({"original_item": original_items[index], "replacement_item": replacement})
+    return changes
 
 
 def _translate(value: Any, field: str | None = None) -> Any:

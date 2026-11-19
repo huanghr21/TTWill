@@ -47,15 +47,15 @@ def trace_runtime(
         "revised-task",
         "order_service",
         "cancel_pending_order",
-        "取消订单 #1",
+        "取消订单 #W0000001",
         revision=3,
-        order_id="#1",
+        order_id="#W0000001",
         status="pending_confirm",
     )
     operation = backend.prepare(
         "u1",
         task.action,
-        {"order_id": "#1", "reason": "no longer needed"},
+        {"order_id": "#W0000001", "reason": "no longer needed"},
         request_key(task.id, task.revision, task.action),
     )
     task.operation_ids = [operation["operation_id"]]

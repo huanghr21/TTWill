@@ -48,7 +48,7 @@ def entities() -> tuple[dict, dict, dict]:
         },
     }
     order = {
-        "order_id": "#1",
+        "order_id": "#W0000001",
         "user_id": "u1",
         "address": deepcopy(address),
         "status": "pending",

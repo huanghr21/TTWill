@@ -29,30 +29,30 @@ def sections(content: str) -> tuple[dict, dict]:
     [
         (
             "cancel_pending_order",
-            {"order_id": "#1", "reason": "no longer needed"},
+            {"order_id": "#W0000001", "reason": "no longer needed"},
             "取消订单",
             {"订单状态", "取消原因", "支付与退款明细"},
         ),
         (
             "modify_pending_order_address",
-            {"order_id": "#1", **ADDRESS},
+            {"order_id": "#W0000001", **ADDRESS},
             "修改订单收货地址",
             {"订单状态", "地址"},
         ),
         (
             "modify_pending_order_items",
             {
-                "order_id": "#1",
+                "order_id": "#W0000001",
                 "item_ids": ["a"],
                 "new_item_ids": ["b"],
                 "payment_method_id": "gift",
             },
             "修改订单商品规格",
-            {"订单状态", "订单商品", "支付与退款明细"},
+            {"订单状态", "本次商品变更", "支付与退款明细"},
         ),
         (
             "modify_pending_order_payment",
-            {"order_id": "#1", "payment_method_id": "gift"},
+            {"order_id": "#W0000001", "payment_method_id": "gift"},
             "修改订单支付方式",
             {"订单状态", "支付与退款明细"},
         ),
@@ -64,14 +64,14 @@ def sections(content: str) -> tuple[dict, dict]:
         ),
         (
             "return_delivered_order_items",
-            {"order_id": "#2", "item_ids": ["a"], "payment_method_id": "card"},
+            {"order_id": "#W0000002", "item_ids": ["a"], "payment_method_id": "card"},
             "申请退货",
             {"订单状态", "订单商品", "退货商品清单", "退货退款方式", "支付与退款明细"},
         ),
         (
             "exchange_delivered_order_items",
             {
-                "order_id": "#2",
+                "order_id": "#W0000002",
                 "item_ids": ["a"],
                 "new_item_ids": ["b"],
                 "payment_method_id": "gift",
@@ -95,7 +95,12 @@ def test_seven_actions_show_complete_request_and_relevant_preview(
     """七种写动作保留全部请求值与相关预期字段，始终等待确认且不改变源记录。"""
     operation = backend.prepare("u1", action, args, request_key("display", 1, action))
     before = deepcopy(operation)
-    content = operation_content(operation)
+    original_items = (
+        backend.query("u1", "get_order_details", {"order_id": args["order_id"]})["items"]
+        if action == "modify_pending_order_items"
+        else None
+    )
+    content = operation_content(operation, original_items=original_items)
     shown_args, shown_preview = sections(content)
     assert content.startswith(f"待确认：{label}\n")
     assert set(shown_preview) == expected_fields
@@ -138,7 +143,10 @@ def test_user_address_preview_excludes_private_account_details(backend):
     )
     content = operation_content(operation)
     assert "账户：当前账户" in content
-    assert all(text not in content for text in ("u1@example.com", "1234", "300.0", "#1", "#2"))
+    assert all(
+        text not in content
+        for text in ("u1@example.com", "1234", "300.0", "#W0000001", "#W0000002")
+    )
     assert set(sections(content)[1]) == {"地址"}
 
 
@@ -146,7 +154,7 @@ def test_payment_preview_preserves_decimal_amounts_and_transaction_order():
     """展示不计算新金额、不添加币种，付款退款次序与来源小数保持一致。"""
     operation = {
         "action": "modify_pending_order_payment",
-        "args": {"order_id": "#9", "payment_method_id": "new-card"},
+        "args": {"order_id": "#W0000009", "payment_method_id": "new-card"},
         "preview": {
             "status": "pending",
             "payment_history": [

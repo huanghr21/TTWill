@@ -159,7 +159,8 @@ class TaskStore:
 
         更新或撤销前统一对账受影响任务的全部操作。已提交操作必须先核验，
         不能通过模型改口抹去；已完成或已撤销任务保持历史不变。更新保留历史
-        事实和动作，清除旧操作引用，新的准备请求使用递增后的修订号。
+        事实和动作。请求内容未变化时保留当前修订、状态和准备项；有变化时清除
+        旧操作引用，新的准备请求使用递增后的修订号。
 
         Args:
             changes: 已通过严格字段校验的增、改、撤请求列表。
@@ -167,7 +168,8 @@ class TaskStore:
             context: 当前协调者的代码调用上下文，旧操作按原任务关联记录。
 
         Returns:
-            应用完全部变更后的任务清单快照，与内部状态相互隔离。
+            按请求顺序返回本批涉及任务的摘要，仅含 task_id、status、reason、
+            changed；无变化时 changed 为 False、reason 为“无变化”。
 
         Raises:
             BusinessError: 任务不存在、已经终止、存在未核验提交，合并条件
@@ -176,20 +178,30 @@ class TaskStore:
         """
         planned = deepcopy(self.tasks)
         affected: dict[str, str] = {}
+        changes_applied: dict[str, bool] = {}
         try:
-            for change in self._coalesce(changes):
-                if change.task_id in affected:
+            normalized = [
+                change.model_copy(
+                    update={"order_id": gateway.normalize_order_id(context, change.order_id)}
+                )
+                if change.order_id is not None
+                else change
+                for change in changes
+            ]
+            for change in self._coalesce(normalized):
+                if change.task_id in changes_applied:
                     raise BusinessError(
                         "同批次不能重复修改或撤销同一任务，请一次给出最终完整规格",
                         code="invalid_task_change",
                     )
-                task_id = self._plan(planned, change)
+                task_id, changed = self._plan(planned, change)
+                if task_id in changes_applied:
+                    raise BusinessError(
+                        "同批次不能重复修改或撤销同一任务，请一次给出最终完整规格",
+                        code="invalid_task_change",
+                    )
+                changes_applied[task_id] = changed
                 if task_id in self.tasks:
-                    if task_id in affected:
-                        raise BusinessError(
-                            "同批次不能重复修改或撤销同一任务，请一次给出最终完整规格",
-                            code="invalid_task_change",
-                        )
                     affected[task_id] = change.reason or "任务请求已修改，作废旧准备操作"
             operations = self._reconcile(affected, gateway, context)
         except BusinessError as exc:
@@ -197,6 +209,8 @@ class TaskStore:
             raise
 
         for task_id, records in operations.items():
+            if not changes_applied[task_id]:
+                continue
             task_context = replace(context, task_id=task_id, revision=self.tasks[task_id].revision)
             for operation in records:
                 if operation["status"] == "prepared":
@@ -219,7 +233,15 @@ class TaskStore:
             "task_update", "apply_tasks", attrs={"before": before, "after": after}
         ):
             self.tasks = planned
-        return self.snapshot()
+        return [
+            {
+                "task_id": task_id,
+                "status": planned[task_id].status,
+                "reason": planned[task_id].reason if changed else "无变化",
+                "changed": changed,
+            }
+            for task_id, changed in changes_applied.items()
+        ]
 
     @staticmethod
     def _coalesce(changes: list[TaskChange]) -> list[TaskChange]:
@@ -270,7 +292,7 @@ class TaskStore:
         """按出现顺序保留两条独立诉求，完全相同的内容只保留一次。"""
         return first if first == second else f"{first}\n{second}"
 
-    def _plan(self, planned: dict[str, Task], change: TaskChange) -> str:
+    def _plan(self, planned: dict[str, Task], change: TaskChange) -> tuple[str, bool]:
         """在独立任务副本上校验并模拟一项变更。
 
         Args:
@@ -278,7 +300,7 @@ class TaskStore:
             change: 单项增、改、撤请求。
 
         Returns:
-            本项变更影响的任务标识。
+            本项请求涉及的任务标识，以及请求内容是否实际变化。
 
         Raises:
             BusinessError: 任务不存在、已经终止、更新后与另一活跃任务重复，
@@ -299,7 +321,7 @@ class TaskStore:
                 missing=deepcopy(change.missing or []),
             )
             planned[task.id] = task
-            return task.id
+            return task.id, True
         task_id = existing.id if existing is not None else change.task_id
         if task_id not in planned:
             raise BusinessError("任务不存在", code="task_not_found")
@@ -316,6 +338,26 @@ class TaskStore:
                 raise BusinessError(
                     "更新目标已有同单同类任务，请更新现有任务", code="invalid_task_change"
                 )
+        candidate = {}
+        if change.operation != "cancel":
+            candidate = {
+                "capability": change.capability,
+                "action": change.action,
+                "order_id": change.order_id,
+                "condition": change.condition,
+                "instruction": (
+                    self._join(task.instruction, change.instruction)
+                    if change.operation == "add"
+                    else change.instruction
+                ),
+                "missing": (
+                    list(dict.fromkeys(task.missing + (change.missing or [])))
+                    if change.operation == "add"
+                    else deepcopy(change.missing or [])
+                ),
+            }
+            if all(getattr(task, name) == value for name, value in candidate.items()):
+                return task.id, False
         task.revision += 1
         task.operation_ids = []
         task.message_hint = ""
@@ -324,24 +366,12 @@ class TaskStore:
             task.status = "cancelled"
             task.reason = change.reason
             task.missing = []
-            return task.id
-        task.instruction = (
-            self._join(task.instruction, change.instruction)
-            if change.operation == "add"
-            else change.instruction
-        )
-        task.missing = (
-            list(dict.fromkeys(task.missing + (change.missing or [])))
-            if change.operation == "add"
-            else deepcopy(change.missing or [])
-        )
-        task.capability = change.capability
-        task.action = change.action
-        task.order_id = change.order_id
-        task.condition = change.condition
+            return task.id, True
+        for name, value in candidate.items():
+            setattr(task, name, value)
         task.status = "conditional" if change.condition else "pending"
         task.reason = None
-        return task.id
+        return task.id, True
 
     @staticmethod
     def _same_request(

@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ttwill.core.capabilities import Capability, CapabilityRegistry
+from ttwill.core.task_view import facts_view
 from ttwill.gateway import (
     READ_TOOLS,
     WRITE_TOOLS,
@@ -196,13 +197,15 @@ class SubAgentRunner:
             "完成查询、准备操作或发现信息缺口后，单独调用 finish，参数仅含 missing"
             "（字符串列表）和 message_hint（回复要点字符串）。也可返回同结构 JSON。"
             "任务状态、动作、业务事实与待确认详情由运行代码填写。"
+            "已有事实仅含摘要，办理所需商品、价格及订单细节请重新查询。"
         )
         return [
             {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": json.dumps(
-                    {"instruction": task.instruction, "facts": task.facts}, ensure_ascii=False
+                    {"instruction": task.instruction, "facts": facts_view(task.facts)},
+                    ensure_ascii=False,
                 ),
             },
         ]

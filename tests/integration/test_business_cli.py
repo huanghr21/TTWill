@@ -53,14 +53,16 @@ def test_prepare_commit_and_retry_across_cli_processes(
     tmp_path: Path, backend: RetailBackend
 ) -> None:
     """分进程准备和提交同一操作，准备不改库，重试不产生第二次退款。"""
-    args = json.dumps({"order_id": "#1", "reason": "no longer needed"})
+    args = json.dumps({"order_id": "#W0000001", "reason": "no longer needed"})
     prepared = invoke(
         tmp_path, "prepare", "--tool", "cancel_pending_order", "--task-id", "task-1", "--args", args
     )
     assert prepared.returncode == 0, prepared.stderr
     operation = json.loads(prepared.stdout)
     assert operation["status"] == "prepared"
-    query = invoke(tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#1"}')
+    query = invoke(
+        tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#W0000001"}'
+    )
     assert query.returncode == 0, query.stderr
     assert json.loads(query.stdout)["status"] == "pending"
     lookup = invoke(tmp_path, "operation", "--request-key", operation["request_key"])
@@ -75,7 +77,7 @@ def test_prepare_commit_and_retry_across_cli_processes(
         )
         assert commit.returncode == 0, commit.stderr
         assert json.loads(commit.stdout)["status"] == "committed"
-    order = backend.query("u1", "get_order_details", {"order_id": "#1"})
+    order = backend.query("u1", "get_order_details", {"order_id": "#W0000001"})
     assert order["status"] == "cancelled"
     assert len(order["payment_history"]) == 2
     traces = list((tmp_path / "runs").glob("*/traces/*.jsonl"))
@@ -85,9 +87,18 @@ def test_prepare_commit_and_retry_across_cli_processes(
 
 def test_query_rejects_other_users_order(tmp_path: Path, backend: RetailBackend) -> None:
     """命令行重新验证当前用户，不能按参数读取其他用户的订单。"""
-    result = invoke(tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#3"}')
-    assert result.returncode == 2 and "归属不匹配" in result.stderr
-    assert backend.export_snapshot()["orders"]["#3"]["status"] == "pending"
+    result = invoke(
+        tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#W0000003"}'
+    )
+    assert result.returncode == 2
+    assert "order_id 不合法" in result.stderr
+    assert json.loads(result.stderr.split("合法值：", 1)[1]) == [
+        "#W0000001",
+        "#W0000002",
+        "#W0000004",
+    ]
+    assert "#W0000003" not in result.stderr
+    assert backend.export_snapshot()["orders"]["#W0000003"]["status"] == "pending"
 
 
 def test_reject_then_recover_operation(tmp_path: Path, backend: RetailBackend) -> None:
@@ -100,7 +111,7 @@ def test_reject_then_recover_operation(tmp_path: Path, backend: RetailBackend) -
         "--task-id",
         "task-1",
         "--args",
-        '{"order_id":"#1","reason":"ordered by mistake"}',
+        '{"order_id":"#W0000001","reason":"ordered by mistake"}',
     )
     operation_id = json.loads(prepared.stdout)["operation_id"]
     result = invoke(tmp_path, "reject", "--operation-id", operation_id, "--reason", "用户撤销")
@@ -108,12 +119,14 @@ def test_reject_then_recover_operation(tmp_path: Path, backend: RetailBackend) -
     assert json.loads(result.stdout)["status"] == "rejected"
     recovered = invoke(tmp_path, "operation", "--operation-id", operation_id)
     assert json.loads(recovered.stdout)["reason"] == "用户撤销"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_missing_database_is_reported_without_creating_file(tmp_path: Path) -> None:
     """路径拼错时显示初始化提示，不生成空业务库。"""
-    result = invoke(tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#1"}')
+    result = invoke(
+        tmp_path, "query", "--tool", "get_order_details", "--args", '{"order_id":"#W0000001"}'
+    )
     assert result.returncode == 2 and "请先初始化" in result.stderr
     assert not (tmp_path / "business.sqlite").exists()
 

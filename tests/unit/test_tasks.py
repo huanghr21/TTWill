@@ -49,7 +49,7 @@ def request(**changes: object) -> TaskChange:
             "operation": "add",
             "capability": "order_service",
             "action": "cancel_pending_order",
-            "order_id": "#1",
+            "order_id": "#W0000001",
             "instruction": "取消一号订单",
             **changes,
         }
@@ -134,10 +134,12 @@ def test_cancel_only_accepts_task_id_and_reason() -> None:
 def test_new_tasks_generate_ids_and_isolate_snapshots(runtime: tuple) -> None:
     """任务标识来自代码，快照中的列表修改不会篡改内部事实。"""
     store, gateway, context = runtime
-    snapshot = store.apply([request(missing=["取消原因"])], gateway, context)
+    result = store.apply([request(missing=["取消原因"])], gateway, context)
     task = next(iter(store.tasks.values()))
     assert UUID(task.id).version == 4
     assert task.revision == 1 and task.is_write and task.status == "pending"
+    assert result == [{"task_id": task.id, "status": "pending", "reason": None, "changed": True}]
+    snapshot = store.snapshot()
     snapshot[0]["missing"].append("伪造字段")
     snapshot[0]["facts"].append({"fake": True})
     assert task.missing == ["取消原因"] and task.facts == []
@@ -184,7 +186,7 @@ def test_distinct_actions_orders_and_read_tasks_are_separate(runtime: tuple) -> 
     store.apply(
         [
             request(),
-            request(order_id="#4"),
+            request(order_id="#W0000004"),
             request(action="modify_pending_order_address", instruction="修改地址"),
             request(action="get_order_details"),
             request(action="get_order_details"),
@@ -321,7 +323,7 @@ def test_invalid_later_change_has_no_partial_state_or_rejection(runtime: tuple) 
 def test_all_operations_are_checked_before_any_rejection(runtime: tuple) -> None:
     """批次后项已经提交时，前项仍待确认的操作保持有效。"""
     store, gateway, context = runtime
-    store.apply([request(), request(order_id="#4")], gateway, context)
+    store.apply([request(), request(order_id="#W0000004")], gateway, context)
     first, second = store.tasks.values()
     pending = prepare(gateway, context, first)
     committed = prepare(gateway, context, second)
@@ -343,7 +345,7 @@ def test_all_operations_are_checked_before_any_rejection(runtime: tuple) -> None
 def test_update_cannot_duplicate_another_active_order_action(runtime: tuple) -> None:
     """完整规格更新不能绕过同单同类唯一活跃任务的约束。"""
     store, gateway, context = runtime
-    store.apply([request(), request(order_id="#4")], gateway, context)
+    store.apply([request(), request(order_id="#W0000004")], gateway, context)
     _, second = store.tasks.values()
     before = store.snapshot()
     with pytest.raises(BusinessError, match="已有同单同类任务"):

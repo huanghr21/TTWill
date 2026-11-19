@@ -22,27 +22,27 @@ ADDRESS = {
     "zip": "100000",
 }
 WRITE_CASES = [
-    ("cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}),
-    ("modify_pending_order_address", {"order_id": "#1", **ADDRESS}),
+    ("cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}),
+    ("modify_pending_order_address", {"order_id": "#W0000001", **ADDRESS}),
     (
         "modify_pending_order_items",
         {
-            "order_id": "#1",
+            "order_id": "#W0000001",
             "item_ids": ["a", "x"],
             "new_item_ids": ["b", "y"],
             "payment_method_id": "gift",
         },
     ),
-    ("modify_pending_order_payment", {"order_id": "#1", "payment_method_id": "gift"}),
+    ("modify_pending_order_payment", {"order_id": "#W0000001", "payment_method_id": "gift"}),
     ("modify_user_address", {"user_id": "u1", **ADDRESS}),
     (
         "return_delivered_order_items",
-        {"order_id": "#2", "item_ids": ["a"], "payment_method_id": "card"},
+        {"order_id": "#W0000002", "item_ids": ["a"], "payment_method_id": "card"},
     ),
     (
         "exchange_delivered_order_items",
         {
-            "order_id": "#2",
+            "order_id": "#W0000002",
             "item_ids": ["a", "x"],
             "new_item_ids": ["b", "y"],
             "payment_method_id": "card",
@@ -188,7 +188,9 @@ def test_user_address_verification_ignores_unrelated_orders(
     """用户新增订单不会使已正确更新的默认地址被误判失败。"""
     action, args = WRITE_CASES[4]
     operation = commit_operation(gateway, context, action, args)
-    change_entity(gateway.backend, args, ("orders",), ["#1", "#2", "#4", "#new"])
+    change_entity(
+        gateway.backend, args, ("orders",), ["#W0000001", "#W0000002", "#W0000004", "#new"]
+    )
     assert gateway.verify_operation(context, operation["operation_id"])["verified"] is True
 
 

@@ -75,16 +75,16 @@ def seed_snapshot() -> dict:
                 },
                 "gift": {"id": "gift", "source": "gift_card", "balance": 300.0},
             },
-            "orders": ["#1", "#2", "#4"] if user_id == "u1" else ["#3"],
+            "orders": ["#W0000001", "#W0000002", "#W0000004"] if user_id == "u1" else ["#W0000003"],
         }
         for user_id in ("u1", "u2")
     }
     orders = {}
     for order_id, user_id, status in (
-        ("#1", "u1", "pending"),
-        ("#2", "u1", "delivered"),
-        ("#3", "u2", "pending"),
-        ("#4", "u1", "pending"),
+        ("#W0000001", "u1", "pending"),
+        ("#W0000002", "u1", "delivered"),
+        ("#W0000003", "u2", "pending"),
+        ("#W0000004", "u1", "pending"),
     ):
         orders[order_id] = {
             "order_id": order_id,

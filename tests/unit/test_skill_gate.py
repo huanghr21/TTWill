@@ -53,13 +53,13 @@ def load_for(gateway: ToolGateway, context: CallContext, tool: str) -> dict:
         (
             "order_service",
             "cancel_pending_order",
-            {"order_id": "#1", "reason": "no longer needed"},
+            {"order_id": "#W0000001", "reason": "no longer needed"},
         ),
         (
             "order_service",
             "modify_pending_order_address",
             {
-                "order_id": "#1",
+                "order_id": "#W0000001",
                 "address1": "新地址",
                 "address2": "",
                 "city": "北京",
@@ -85,7 +85,7 @@ def load_for(gateway: ToolGateway, context: CallContext, tool: str) -> dict:
             "order_service",
             "modify_pending_order_items",
             {
-                "order_id": "#1",
+                "order_id": "#W0000001",
                 "item_ids": ["a"],
                 "new_item_ids": ["b"],
                 "payment_method_id": "card",
@@ -94,18 +94,18 @@ def load_for(gateway: ToolGateway, context: CallContext, tool: str) -> dict:
         (
             "order_service",
             "modify_pending_order_payment",
-            {"order_id": "#1", "payment_method_id": "card"},
+            {"order_id": "#W0000001", "payment_method_id": "card"},
         ),
         (
             "after_sales",
             "return_delivered_order_items",
-            {"order_id": "#2", "item_ids": ["a"], "payment_method_id": "card"},
+            {"order_id": "#W0000002", "item_ids": ["a"], "payment_method_id": "card"},
         ),
         (
             "after_sales",
             "exchange_delivered_order_items",
             {
-                "order_id": "#2",
+                "order_id": "#W0000002",
                 "item_ids": ["a"],
                 "new_item_ids": ["b"],
                 "payment_method_id": "card",
@@ -157,10 +157,12 @@ def test_loading_records_actual_text_and_preserves_tool_allowlist(
     skill["content"] = "调用方篡改"
     assert record["result"]["content"] != "调用方篡改"
     operation = gateway.call(
-        context, "cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}
+        context, "cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}
     )
     assert operation["status"] == "prepared"
-    assert backend.query("u1", "get_order_details", {"order_id": "#1"})["status"] == "pending"
+    assert (
+        backend.query("u1", "get_order_details", {"order_id": "#W0000001"})["status"] == "pending"
+    )
 
 
 @pytest.mark.parametrize("dimension", ["session", "user", "capability", "instance"])
@@ -179,9 +181,9 @@ def test_loading_is_scoped_to_complete_instance_identity(
     assert gateway.loaded_skills(alternative) == frozenset()
     tool = "return_delivered_order_items" if dimension == "capability" else "cancel_pending_order"
     args = (
-        {"order_id": "#2", "item_ids": ["a"], "payment_method_id": "card"}
+        {"order_id": "#W0000002", "item_ids": ["a"], "payment_method_id": "card"}
         if dimension == "capability"
-        else {"order_id": "#1", "reason": "no longer needed"}
+        else {"order_id": "#W0000001", "reason": "no longer needed"}
     )
     with pytest.raises(BusinessError) as error:
         gateway.call(alternative, tool, args)
@@ -202,7 +204,7 @@ def test_releasing_instance_clears_only_its_loading_record(
     assert gateway.records == records
     with pytest.raises(BusinessError) as error:
         gateway.call(
-            context, "cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}
+            context, "cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}
         )
     assert error.value.code == "skill_required"
 
@@ -246,7 +248,7 @@ def test_model_cannot_forge_loading_or_context_fields(
     assert not gateway.loaded_skills(context)
     with pytest.raises(BusinessError) as blocked:
         gateway.call(
-            context, "cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}
+            context, "cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}
         )
     assert blocked.value.code == "skill_required"
 
@@ -275,7 +277,7 @@ def test_loading_unrelated_policy_does_not_unlock_cancellation(
     load_for(gateway, context, "modify_user_address")
     with pytest.raises(BusinessError) as error:
         gateway.call(
-            context, "cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}
+            context, "cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}
         )
     assert error.value.code == "skill_required"
 

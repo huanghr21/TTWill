@@ -62,7 +62,7 @@ def finish(*, missing: list[str] | None = None, hint: str = "请核对操作详�
     return response(("finish", {"missing": missing or [], "message_hint": hint}))
 
 
-def cancel_steps(order_id: str = "#1") -> list[dict]:
+def cancel_steps(order_id: str = "#W0000001") -> list[dict]:
     """构造查询、加载政策、准备取消和结束的脚本。
 
     Args:
@@ -137,7 +137,7 @@ def run_task(runner, *, capability="order_service", task=None, session=None, mod
         runner.run(
             session or SessionContext("session", "u1"),
             capability,
-            task or DispatchTask("task", "取消订单 #1", is_write=True),
+            task or DispatchTask("task", "取消订单 #W0000001", is_write=True),
             model_tier=model_tier,
         )
     )
@@ -170,7 +170,7 @@ def test_cancel_returns_real_pending_operation_without_committing(runtime, backe
     assert not gateway.loaded_skills(context)
     first_request = fake.requests[0]
     assert len(first_request["messages"]) == 2
-    assert "取消订单 #1" in first_request["messages"][1]["content"]
+    assert "取消订单 #W0000001" in first_request["messages"][1]["content"]
     assert "已送达订单的退货" not in first_request["messages"][0]["content"]
     events = trace_events(gateway.trace.path)
     starts = [event for event in events if event["event"] == "start"]
@@ -188,12 +188,12 @@ def test_return_uses_after_sales_skill_and_keeps_database_unchanged(runtime, bac
     """售后实例通过退货 Skill 准备申请，业务订单仍是已送达。"""
     runner, _, _ = runtime(
         [
-            response(("get_order_details", {"order_id": "#2"})),
+            response(("get_order_details", {"order_id": "#W0000002"})),
             response(("load_skill", {"name": "return_delivered_order"})),
             response(
                 (
                     "return_delivered_order_items",
-                    {"order_id": "#2", "item_ids": ["a", "x"], "payment_method_id": "card"},
+                    {"order_id": "#W0000002", "item_ids": ["a", "x"], "payment_method_id": "card"},
                 )
             ),
             finish(),
@@ -206,7 +206,9 @@ def test_return_uses_after_sales_skill_and_keeps_database_unchanged(runtime, bac
     )
     assert result["status"] == "need_confirm"
     assert result["pending_confirmation"][0]["preview"]["status"] == "return requested"
-    assert backend.query("u1", "get_order_details", {"order_id": "#2"})["status"] == "delivered"
+    assert (
+        backend.query("u1", "get_order_details", {"order_id": "#W0000002"})["status"] == "delivered"
+    )
 
 
 def test_missing_fields_are_the_only_model_provided_state(runtime):
@@ -253,20 +255,20 @@ def test_plain_json_finish_and_read_result_are_supported(runtime):
     """合法文本 JSON 可以结束只读任务，状态依据实际查询结果生成。"""
     runner, _, _ = runtime(
         [
-            response(("get_order_details", {"order_id": "#1"})),
+            response(("get_order_details", {"order_id": "#W0000001"})),
             response(content={"missing": [], "message_hint": "订单待发货。"}),
         ]
     )
     result = run_task(runner, task=DispatchTask("read", "查询订单"))
     assert result["status"] == "ready"
-    assert result["facts"][0]["result"]["order_id"] == "#1"
+    assert result["facts"][0]["result"]["order_id"] == "#W0000001"
 
 
 def test_thinking_messages_survive_tool_loop_and_invalid_text(runtime):
     """工具循环和无工具的格式修正均回传完整思考字段，原始响应仍可追溯。"""
     script = [
-        response(("get_order_details", {"order_id": "#1"})),
-        response(("get_order_details", {"order_id": "#2"})),
+        response(("get_order_details", {"order_id": "#W0000001"})),
+        response(("get_order_details", {"order_id": "#W0000002"})),
         response(content="订单信息已查到。"),
         finish(hint="两笔订单已查询。"),
     ]
@@ -309,7 +311,7 @@ def test_write_without_skill_is_rejected_and_can_be_retried_after_loading(runtim
     assert result["actions"][0]["status"] == "failed"
     assert result["actions"][1]["status"] == "prepared"
     assert "skill" in fake.requests[1]["messages"][-1]["content"]
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_invalid_json_unknown_tool_and_business_error_each_consume_steps(runtime):
@@ -318,7 +320,7 @@ def test_invalid_json_unknown_tool_and_business_error_each_consume_steps(runtime
         [
             response(("get_order_details", "{broken")),
             response(("commit", {"operation_id": "invented"})),
-            response(("get_order_details", {"order_id": "#3"})),
+            response(("get_order_details", {"order_id": "#W0000003"})),
             finish(missing=["本人订单号"]),
         ],
         max_steps=4,
@@ -334,8 +336,8 @@ def test_batch_tools_cannot_exceed_budget_and_failed_prepare_is_rejected(runtime
     """单个响应塞入大量调用只能执行剩余预算，已准备操作在失败时释放。"""
     calls = [
         ("load_skill", {"name": "cancel_pending_order"}),
-        ("cancel_pending_order", {"order_id": "#1", "reason": "no longer needed"}),
-    ] + [("get_order_details", {"order_id": "#4"})] * 100
+        ("cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}),
+    ] + [("get_order_details", {"order_id": "#W0000004"})] * 100
     runner, fake, gateway = runtime([response(*calls)], max_steps=2)
     result = run_task(runner)
     assert result["status"] == "failed"
@@ -360,7 +362,7 @@ def test_finish_at_exact_budget_succeeds_and_same_batch_finish_is_rejected(runti
         [
             response(
                 ("finish", {"missing": [], "message_hint": "结束"}),
-                ("get_order_details", {"order_id": "#1"}),
+                ("get_order_details", {"order_id": "#W0000001"}),
             ),
             finish(hint="订单待发货"),
         ],
@@ -378,7 +380,9 @@ def test_new_instance_has_no_previous_context_or_skill_unlock(runtime):
     first = run_task(runner)
     second_runner, second_fake, _ = runtime(
         [
-            response(("cancel_pending_order", {"order_id": "#4", "reason": "no longer needed"})),
+            response(
+                ("cancel_pending_order", {"order_id": "#W0000004", "reason": "no longer needed"})
+            ),
             finish(missing=["本次操作政策"]),
         ]
     )
@@ -387,7 +391,9 @@ def test_new_instance_has_no_previous_context_or_skill_unlock(runtime):
     assert second["status"] == "need_info"
     assert second["actions"][0]["status"] == "failed"
     assert len(second_fake.requests[0]["messages"]) == 2
-    assert "取消订单 #1" not in json.dumps(second_fake.requests[0]["messages"], ensure_ascii=False)
+    assert "取消订单 #W0000001" not in json.dumps(
+        second_fake.requests[0]["messages"], ensure_ascii=False
+    )
     assert len(second["actions"]) == 1
     assert second["pending_confirmation"] == []
     assert any(record["instance_id"] == second["instance_id"] for record in gateway.records)
@@ -408,7 +414,7 @@ def test_committed_retry_requires_verification_and_cannot_become_done(runtime, b
     assert retry["status"] == "needs_verification"
     assert retry["pending_confirmation"] == []
     assert retry["actions"][0]["result"]["status"] == "committed"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
 
 
 def test_model_error_after_prepare_rejects_operation_and_releases_skill(runtime, backend):
@@ -528,7 +534,7 @@ def test_registry_and_dispatch_validate_identity_revision_and_budget(runtime):
 
 def test_model_tier_override_and_confirmed_facts_enter_only_new_task(runtime):
     """派发可覆盖模型档位，已确认事实通过任务输入传递且保持原对象。"""
-    known = [{"tool": "get_order_details", "result": {"order_id": "#1"}}]
+    known = [{"tool": "get_order_details", "result": {"order_id": "#W0000001"}}]
     original = deepcopy(known)
     runner, fake, _ = runtime(
         [finish(missing=["取消原因"])],
@@ -541,7 +547,9 @@ def test_model_tier_override_and_confirmed_facts_enter_only_new_task(runtime):
     )
     assert result["status"] == "need_info"
     assert fake.requests[0]["model"] == "strong"
-    assert json.loads(fake.requests[0]["messages"][1]["content"])["facts"] == original
+    assert json.loads(fake.requests[0]["messages"][1]["content"])["facts"] == [
+        {"tool": "get_order_details", "result_summary": {"order_id": "#W0000001"}}
+    ]
     assert known == original
 
 
@@ -604,8 +612,8 @@ def test_trace_error_after_prepare_rejects_operation(runtime, backend, kind):
 
 def test_concurrent_instances_keep_context_and_results_separate(runtime):
     """同一会话并发派发两笔订单时，Skill、事实、动作和轨迹按实例隔离。"""
-    first_runner, first_fake, gateway = runtime(cancel_steps("#1"))
-    second_runner, second_fake, _ = runtime(cancel_steps("#4"))
+    first_runner, first_fake, gateway = runtime(cancel_steps("#W0000001"))
+    second_runner, second_fake, _ = runtime(cancel_steps("#W0000004"))
 
     def interleave(fake):
         """在假模型返回前让出事件循环，使两实例交错执行。"""
@@ -626,16 +634,16 @@ def test_concurrent_instances_keep_context_and_results_separate(runtime):
         session = SessionContext("session", "u1")
         return await asyncio.gather(
             first_runner.run(
-                session, "order_service", DispatchTask("first", "取消 #1", is_write=True)
+                session, "order_service", DispatchTask("first", "取消 #W0000001", is_write=True)
             ),
             second_runner.run(
-                session, "order_service", DispatchTask("second", "取消 #4", is_write=True)
+                session, "order_service", DispatchTask("second", "取消 #W0000004", is_write=True)
             ),
         )
 
     results = asyncio.run(exercise())
     assert len({result["instance_id"] for result in results}) == 2
-    for result, expected_order in zip(results, ("#1", "#4"), strict=True):
+    for result, expected_order in zip(results, ("#W0000001", "#W0000004"), strict=True):
         assert result["status"] == "need_confirm"
         assert len(result["actions"]) == len(result["facts"]) == 1
         assert result["pending_confirmation"][0]["args"]["order_id"] == expected_order

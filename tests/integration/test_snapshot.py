@@ -11,7 +11,7 @@ def test_export_snapshot_uses_one_view_during_concurrent_commit(
     tmp_path: Path, seed_snapshot: dict
 ) -> None:
     """读取用户后提交礼品卡退款，当前快照仍同时保留旧余额和旧订单。"""
-    seed_snapshot["orders"]["#1"]["payment_history"][0]["payment_method_id"] = "gift"
+    seed_snapshot["orders"]["#W0000001"]["payment_history"][0]["payment_method_id"] = "gift"
     path = tmp_path / "snapshot.sqlite"
     reader = RetailBackend(path)
     writer = RetailBackend(path)
@@ -20,7 +20,7 @@ def test_export_snapshot_uses_one_view_during_concurrent_commit(
         with reader.engine.connect() as connection:
             # WAL 允许在读取快照时提交另一事务，使读写交错可以在同一线程稳定复现。
             assert connection.exec_driver_sql("PRAGMA journal_mode=WAL").scalar_one() == "wal"
-        args = {"order_id": "#1", "reason": "no longer needed"}
+        args = {"order_id": "#W0000001", "reason": "no longer needed"}
         operation = writer.prepare(
             "u1", "cancel_pending_order", args, request_key("snapshot", 1, "cancel_pending_order")
         )
@@ -43,7 +43,7 @@ def test_export_snapshot_uses_one_view_during_concurrent_commit(
 
         current = writer.export_snapshot()
         assert current["users"]["u1"]["payment_methods"]["gift"]["balance"] == 360.0
-        assert current["orders"]["#1"]["status"] == "cancelled"
+        assert current["orders"]["#W0000001"]["status"] == "cancelled"
     finally:
         writer.close()
         reader.close()

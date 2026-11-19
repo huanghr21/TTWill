@@ -13,10 +13,10 @@ from ttwill.backend import BusinessError, RetailBackend, request_key
 from ttwill.backend.store import orders, products, users
 
 CANCEL = "cancel_pending_order"
-CANCEL_ARGS = {"order_id": "#1", "reason": "no longer needed"}
+CANCEL_ARGS = {"order_id": "#W0000001", "reason": "no longer needed"}
 MODIFY = "modify_pending_order_items"
 MODIFY_ARGS = {
-    "order_id": "#1",
+    "order_id": "#W0000001",
     "item_ids": ["a"],
     "new_item_ids": ["b"],
     "payment_method_id": "gift",
@@ -95,7 +95,7 @@ def test_prepare_key_conflict_preserves_original(
 
 @pytest.mark.parametrize(
     ("action", "args"),
-    [("get_order_details", {"order_id": "#3"}), ("get_user_details", {"user_id": "u2"})],
+    [("get_order_details", {"order_id": "#W0000003"}), ("get_user_details", {"user_id": "u2"})],
 )
 def test_query_denies_other_users_records(backend: RetailBackend, action: str, args: dict) -> None:
     """已验证用户不能读取他人的订单或账户资料。"""
@@ -108,7 +108,7 @@ def test_prepare_denies_other_users_order(backend: RetailBackend, seed_snapshot:
     """订单归属不匹配时不能生成准备记录，也不能改动业务数据。"""
     with pytest.raises(BusinessError) as caught:
         backend.prepare(
-            "u1", CANCEL, {**CANCEL_ARGS, "order_id": "#3"}, request_key("t1", 1, CANCEL)
+            "u1", CANCEL, {**CANCEL_ARGS, "order_id": "#W0000003"}, request_key("t1", 1, CANCEL)
         )
     assert caught.value.code == "forbidden"
     assert backend.export_snapshot() == seed_snapshot
@@ -160,7 +160,7 @@ def test_commit_retries_return_saved_result(backend: RetailBackend, peer: Retail
     assert committed["status"] == "committed"
     snapshot = peer.export_snapshot()
     assert snapshot["users"]["u1"]["payment_methods"]["gift"]["balance"] == 290.0
-    assert len(snapshot["orders"]["#1"]["payment_history"]) == 2
+    assert len(snapshot["orders"]["#W0000001"]["payment_history"]) == 2
     assert [entry["status"] for entry in peer.operation_events("u1", prepared["operation_id"])] == [
         "prepared",
         "committed",
@@ -212,7 +212,7 @@ def test_pending_target_blocks_other_action_but_not_other_order(backend: RetailB
         backend.prepare("u1", MODIFY, MODIFY_ARGS, request_key("t2", 1, MODIFY))
     assert caught.value.code == "target_busy"
     other = backend.prepare(
-        "u1", CANCEL, {**CANCEL_ARGS, "order_id": "#4"}, request_key("t3", 1, CANCEL)
+        "u1", CANCEL, {**CANCEL_ARGS, "order_id": "#W0000004"}, request_key("t3", 1, CANCEL)
     )
     assert other["status"] == "prepared"
 
@@ -245,10 +245,10 @@ def test_reject_cannot_erase_committed_fact(backend: RetailBackend) -> None:
 def test_commit_revalidates_status_and_records_failure(backend: RetailBackend) -> None:
     """准备后订单状态改变会导致提交失败，失败事件与释放占用一并保存。"""
     prepared = backend.prepare("u1", CANCEL, CANCEL_ARGS, request_key("t1", 1, CANCEL))
-    changed = backend.query("u1", "get_order_details", {"order_id": "#1"})
+    changed = backend.query("u1", "get_order_details", {"order_id": "#W0000001"})
     changed["status"] = "processed"
     with backend.engine.begin() as connection:
-        connection.execute(update(orders).where(orders.c.id == "#1").values(data=changed))
+        connection.execute(update(orders).where(orders.c.id == "#W0000001").values(data=changed))
     with pytest.raises(BusinessError) as caught:
         backend.commit("u1", prepared["operation_id"], CANCEL_ARGS)
     assert caught.value.code == "invalid_status"
@@ -258,10 +258,10 @@ def test_commit_revalidates_status_and_records_failure(backend: RetailBackend) -
     assert [
         entry["status"] for entry in backend.operation_events("u1", prepared["operation_id"])
     ] == ["prepared", "failed"]
-    assert backend.query("u1", "get_order_details", {"order_id": "#1"}) == changed
+    assert backend.query("u1", "get_order_details", {"order_id": "#W0000001"}) == changed
     changed["status"] = "pending"
     with backend.engine.begin() as connection:
-        connection.execute(update(orders).where(orders.c.id == "#1").values(data=changed))
+        connection.execute(update(orders).where(orders.c.id == "#W0000001").values(data=changed))
     renewed = backend.prepare("u1", CANCEL, CANCEL_ARGS, request_key("t1", 2, CANCEL))
     assert renewed["status"] == "prepared"
 
@@ -291,7 +291,9 @@ def test_commit_rechecks_gift_card_balance(backend: RetailBackend) -> None:
     with pytest.raises(BusinessError) as caught:
         backend.commit("u1", prepared["operation_id"], MODIFY_ARGS)
     assert caught.value.code == "insufficient_balance"
-    assert backend.query("u1", "get_order_details", {"order_id": "#1"})["status"] == "pending"
+    assert (
+        backend.query("u1", "get_order_details", {"order_id": "#W0000001"})["status"] == "pending"
+    )
 
 
 def test_event_write_failure_rolls_back_business_and_commit_marker(

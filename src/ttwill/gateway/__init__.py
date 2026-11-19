@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ttwill.backend import BusinessError, RetailBackend, request_key
 from ttwill.backend.arguments import ARGUMENT_MODELS, validate_arguments
+from ttwill.gateway.identifiers import normalize_arguments, normalize_order_id
+from ttwill.gateway.presentation import operation_content
 from ttwill.gateway.skills import SkillCatalog
 from ttwill.gateway.verification import verification_query, verify_business_result
 from ttwill.tracing import Trace
@@ -27,7 +29,7 @@ AFTER_SALES_WRITES = frozenset({"exchange_delivered_order_items", "return_delive
 WRITE_TOOLS = ORDER_WRITES | AFTER_SALES_WRITES
 READ_TOOLS = frozenset(ARGUMENT_MODELS) - WRITE_TOOLS - IDENTITY_TOOLS
 CAPABILITY_TOOLS = {
-    "coordinator": IDENTITY_TOOLS | {"get_user_details"},
+    "coordinator": IDENTITY_TOOLS | READ_TOOLS,
     "order_service": READ_TOOLS | ORDER_WRITES | {"load_skill"},
     "after_sales": READ_TOOLS | AFTER_SALES_WRITES | {"load_skill"},
 }
@@ -208,6 +210,24 @@ class ToolGateway:
         self._guard(context.session.user_id is not None, "identity_required", "请先验证用户身份")
         return context.session.user_id
 
+    def normalize_order_id(self, context: CallContext, value: str) -> str:
+        """在任务入口规范订单号，并核对当前已验证用户的权威订单列表。
+
+        Args:
+            context: 提供代码保存的已验证用户身份。
+            value: 模型给出的订单号。
+
+        Returns:
+            通过格式及归属校验的规范订单号。
+
+        Raises:
+            BusinessError: 未验证身份、格式错误或订单不属于当前用户；标识符
+                错误包含当前用户的合法订单列表。
+        """
+        user_id = self._identity(context)
+        user = self.backend.query(user_id, "get_user_details", {"user_id": user_id})
+        return normalize_order_id(value, user["orders"])
+
     def _attrs(self, context: CallContext, name: str, args: dict, kind: str) -> dict:
         """构造调用记录和工具轨迹共用的上下文信息。
 
@@ -216,7 +236,8 @@ class ToolGateway:
             name: 工具名称或代码操作名称。
             args: 调用参数；写入记录时复制，避免后续修改影响轨迹。
             kind: 调用类别，为 call、commit、reject、operation（操作对账）、
-                verification（核验）或 verification_read（核验中的业务重读）。
+                verification（核验）、verification_read（核验中的业务重读）或
+                presentation_read（确认展示中的原订单读取）。
 
         Returns:
             包含调用类别、上下文标识、动作名称、参数副本和读写类别的属性字典。
@@ -306,8 +327,16 @@ class ToolGateway:
                     self._guard(bool(context.task_id), "task_required", "准备写操作需要任务 ID")
                     key = request_key(context.task_id, context.revision, name)
                     span.attrs["request_key"] = key
+                    arguments = normalize_arguments(
+                        self.backend, context.session.user_id, arguments, request_key=key
+                    )
+                    span.attrs["args"] = deepcopy(arguments)
                     result = self.backend.prepare(context.session.user_id, name, arguments, key)
                 else:
+                    arguments = normalize_arguments(
+                        self.backend, context.session.user_id, arguments
+                    )
+                    span.attrs["args"] = deepcopy(arguments)
                     result = self.backend.query(context.session.user_id, name, arguments)
             except BusinessError as exc:
                 span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
@@ -373,6 +402,41 @@ class ToolGateway:
             BusinessError: 身份尚未验证、操作不存在，或操作不属于当前用户。
         """
         return self._resolve(context, "operation", operation_id, {})
+
+    def operation_content(self, context: CallContext, operation: dict) -> str:
+        """核对准备记录并读取原始商品，生成只包含本次改动的确认正文。
+
+        此方法由回复代码调用，不注册为模型工具；完整后端参数与预览保持原状。
+
+        Args:
+            context: 含已验证会话身份的代码调用上下文。
+            operation: 需要展示的准备记录，使用 operation_id 从后端核对归属和状态。
+
+        Returns:
+            用户可确认的中文正文；修改商品时按请求逐项展示原商品与新规格。
+
+        Raises:
+            BusinessError: 身份未验证、操作归属不符、操作不再待确认，或原单查询失败。
+            ValueError: 原订单条目与准备时的商品替换记录不一致。
+        """
+        current = self.get_operation(context, operation["operation_id"])
+        if current["status"] != "prepared":
+            raise BusinessError("只能展示待确认操作", code="operation_not_prepared")
+        original_items = None
+        if current["action"] == "modify_pending_order_items":
+            args = {"order_id": current["args"]["order_id"]}
+            attrs = self._attrs(context, "get_order_details", args, "presentation_read")
+            with self.trace.span("tool", "get_order_details", attrs=attrs) as span:
+                try:
+                    order = self.backend.query(context.session.user_id, "get_order_details", args)
+                except BusinessError as exc:
+                    span.attrs.update(status="failed", error_code=exc.code, reason=str(exc))
+                    self.records.append(deepcopy(span.attrs))
+                    raise
+                span.attrs.update(status="executed", result=deepcopy(order))
+                self.records.append(deepcopy(span.attrs))
+            original_items = order["items"]
+        return operation_content(current, original_items=original_items)
 
     def find_operation(self, context: CallContext, action: str) -> dict | None:
         """由恢复代码重算请求标识，找回尚未写入检查点的后端操作。

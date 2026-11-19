@@ -9,10 +9,19 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from ttwill.core.confirmation import ConfirmationJudge
+from ttwill.core.context import STATE_NOTICE
 from ttwill.core.subagent import DispatchTask, SubAgentRunner
+from ttwill.core.task_view import task_brief, task_view
 from ttwill.core.tasks import Task, TaskChange, TaskStore
-from ttwill.gateway import BusinessError, CallContext, SessionContext, ToolGateway
-from ttwill.gateway.presentation import action_label, operation_content
+from ttwill.gateway import (
+    IDENTITY_TOOLS,
+    READ_TOOLS,
+    BusinessError,
+    CallContext,
+    SessionContext,
+    ToolGateway,
+)
+from ttwill.gateway.presentation import action_label
 from ttwill.llm import LLMClient
 from ttwill.llm.types import LLMError
 
@@ -187,7 +196,7 @@ class Coordinator:
         Args:
             state: 当前会话与任务状态，工具执行结果写回此对象。
             work: 原地更新的本轮进度；产生最终回复时写入 result。
-            messages: 上下文编译器本次生成的模型输入；None 时使用完整原始消息。
+            messages: 上下文编译器本次生成的模型输入；None 时给原始往返注入最新状态。
                 确认判定始终使用 work.user_message 与 work.previous。
 
         Raises:
@@ -202,11 +211,13 @@ class Coordinator:
             return
         context = CallContext(state.session, "coordinator", work.instance_id)
         work.rounds += 1
+        # 本次响应只能使用发出请求时的权限，身份查询不能给同一批后续调用提权。
+        business_tools = {schema["function"]["name"] for schema in self.gateway.schemas(context)}
         try:
             response = await self.llm.complete(
                 self.model_tier,
-                work.messages if messages is None else messages,
-                tools=self._schemas(context, work.confirmed),
+                self._model_messages(state, work) if messages is None else messages,
+                tools=self._schemas(state, work),
             )
         except (LLMError, TimeoutError) as exc:
             self.stop_turn(state, work, f"协调模型调用失败：{type(exc).__name__}")
@@ -225,102 +236,119 @@ class Coordinator:
                 if response.message["content"] == work.result["reply"]:
                     state.history[-1] = deepcopy(response.message)
                 return
-        if len(calls) != 1:
+        readonly_batch = calls and all(
+            call["function"]["name"] in READ_TOOLS | IDENTITY_TOOLS for call in calls
+        )
+        if not calls or (len(calls) > 1 and not readonly_batch):
             work.invalid_outputs.append(deepcopy(response.message))
             self._guard(
                 "coordinator_format",
-                "每轮须调用一个协调工具，可用 complete_plan 或 dispatch_tasks 的 task_ids 批量分派",
+                "多个调用必须全部是只读业务工具；协调工具每次只能调用一个",
             )
             work.messages.append(
                 {
                     "role": "user",
-                    "content": "请只调用一个工具。结束计划并分派用 complete_plan(task_ids=[...])；"
-                    "计划结束后用 dispatch_tasks。",
+                    "content": "可一次调用多个只读业务工具；协调工具每次只调用一个。"
+                    "批量任务更新用 update_tasks.changes，批量分派用 task_ids。",
                 }
             )
         else:
             work.messages.append(deepcopy(response.message))
-            call = calls[0]
-            name = call["function"]["name"]
-            try:
-                arguments = json.loads(call["function"]["arguments"])
-                if not isinstance(arguments, dict):
-                    raise ValueError("工具参数必须是对象")
-                if name == "update_tasks":
-                    self._require_identity(state)
-                    updates = UpdateTasks.model_validate(arguments)
-                    for change in updates.changes:
-                        if change.capability is not None:
-                            self.runner.registry.get(change.capability)
-                    outcome = state.tasks.apply(updates.changes, self.gateway, context)
-                elif name == "complete_plan":
-                    self._require_identity(state)
-                    plan = CompletePlan.model_validate(arguments)
-                    if work.confirmed:
-                        raise ValueError("本轮已经判定过用户确认")
-                    # 先拒绝无效选择，避免错误参数触发用户确认对应的业务提交。
-                    self._dispatch_candidates(state, plan.task_ids)
-                    work.decisions = await self._confirm(
-                        state, context, work.user_message, work.previous
+            for call in calls:
+                try:
+                    arguments = json.loads(call["function"]["arguments"])
+                    if not isinstance(arguments, dict):
+                        raise ValueError("工具参数必须是对象")
+                    outcome = await self._execute_call(
+                        state, work, context, call["function"]["name"], arguments, business_tools
                     )
-                    work.confirmed = True
+                except ValueError as exc:
+                    self._guard("coordinator_tool", str(exc))
                     outcome = {
-                        "confirmation_results": work.decisions,
-                        "tasks": state.tasks.snapshot(),
+                        "error": getattr(exc, "code", "invalid_tool_call"),
+                        "reason": str(exc),
                     }
-                    if plan.task_ids:
-                        outcome.update(await self._dispatch(state, context, plan.task_ids))
-                        outcome["tasks"] = state.tasks.snapshot()
-                elif name == "dispatch_tasks":
-                    self._require_identity(state)
-                    if not work.confirmed:
-                        raise ValueError("先提出所有任务修改并调用 complete_plan，再分派")
-                    selection = DispatchTasks.model_validate(arguments)
-                    outcome = await self._dispatch(state, context, selection.task_ids)
-                elif name == "reply":
-                    proposal = Reply.model_validate(arguments)
-                    if not self._can_reply(state, work):
-                        raise ValueError("先提出所有任务修改并调用 complete_plan，再回复")
-                    self._reconcile(state, context)
-                    unfinished = self._actionable(state)
-                    if unfinished:
-                        raise ValueError(
-                            f"任务仍需推进或判断条件：{unfinished}；先分派、补充缺失信息或撤销不再需要的条件分支"
-                        )
-                    work.result = self._reply(state, context, proposal, work.decisions, work.rounds)
-                    outcome = {"replied": True}
-                elif name in {
-                    schema["function"]["name"] for schema in self.gateway.schemas(context)
-                }:
-                    outcome = self.gateway.call(context, name, arguments)
-                else:
-                    raise ValueError(f"当前阶段没有工具：{name}")
-            except ValueError as exc:
-                self._guard("coordinator_tool", str(exc))
-                outcome = {"error": getattr(exc, "code", "invalid_tool_call"), "reason": str(exc)}
-            work.messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": json.dumps(outcome, ensure_ascii=False),
-                }
-            )
-            # 持久运行时每次编译已注入最新权威快照，不再把同一份状态反复写成用户消息。
-            if work.result is None and messages is None:
                 work.messages.append(
                     {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tasks": state.tasks.snapshot(),
-                                "verified": state.session.user_id is not None,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": json.dumps(outcome, ensure_ascii=False),
                     }
                 )
         if work.result is None and work.rounds == self.max_rounds:
             self.stop_turn(state, work, f"协调者达到本轮上限 {self.max_rounds}，未完成本轮处理")
+
+    async def _execute_call(
+        self,
+        state: ConversationState,
+        work: TurnState,
+        context: CallContext,
+        name: str,
+        arguments: dict,
+        business_tools: set[str],
+    ) -> dict | list[dict] | str:
+        """执行一个已通过批次形状检查的调用，任务与确认护栏仍逐项验证。
+
+        Args:
+            state: 当前会话与可信任务状态，按调用结果更新。
+            work: 本轮进度，保存确认结果及最终回复。
+            context: 本轮协调者的代码调用身份。
+            name: 模型选出的单个工具名称。
+            arguments: 已解析为对象的工具参数。
+            business_tools: 本次模型请求发出时可用的业务工具名称。
+
+        Returns:
+            要与当前 tool_call_id 配对保存的业务或协调结果。
+
+        Raises:
+            ValueError: 参数、阶段、身份或业务护栏拒绝此次调用。
+        """
+        if name == "update_tasks":
+            self._require_identity(state)
+            updates = UpdateTasks.model_validate(arguments)
+            for change in updates.changes:
+                if change.capability is not None:
+                    self.runner.registry.get(change.capability)
+            return state.tasks.apply(updates.changes, self.gateway, context)
+        if name == "complete_plan":
+            self._require_identity(state)
+            plan = CompletePlan.model_validate(arguments)
+            if work.confirmed:
+                raise ValueError("本轮已经判定过用户确认")
+            work.decisions = await self._confirm(state, context, work.user_message, work.previous)
+            work.confirmed = True
+            selected, blocked = self._plan_candidates(state, plan.task_ids)
+            dispatched = (
+                await self._dispatch(state, context, selected)
+                if selected
+                else {"dispatched": [], "blocked": []}
+            )
+            return {
+                "confirmation_results": self._confirmation_view(work.decisions),
+                "dispatched": dispatched["dispatched"],
+                "blocked": blocked + dispatched["blocked"],
+            }
+        if name == "dispatch_tasks":
+            self._require_identity(state)
+            if self._requires_plan(state, work):
+                raise ValueError("先提出所有任务修改并调用 complete_plan，再分派")
+            selection = DispatchTasks.model_validate(arguments)
+            return await self._dispatch(state, context, selection.task_ids)
+        if name == "reply":
+            proposal = Reply.model_validate(arguments)
+            if not self._can_reply(state, work):
+                raise ValueError("先提出所有任务修改并调用 complete_plan，再回复")
+            self._reconcile(state, context)
+            unfinished = self._actionable(state)
+            if unfinished:
+                raise ValueError(
+                    f"任务仍需推进或判断条件：{unfinished}；先分派、补充缺失信息或撤销不再需要的条件分支"
+                )
+            work.result = self._reply(state, context, proposal, work.decisions, work.rounds)
+            return {"replied": True}
+        if name in business_tools:
+            return self.gateway.call(context, name, arguments)
+        raise ValueError(f"当前阶段没有工具：{name}")
 
     def stop_turn(self, state: ConversationState, work: TurnState, reason: str) -> None:
         """说明本轮无法继续的原因，终止可推进任务并保留已等待用户的结果。
@@ -342,7 +370,7 @@ class Coordinator:
         )
 
     def _messages(self, state: ConversationState) -> list[dict]:
-        """组装固定政策、历史和本轮可信任务快照。
+        """组装固定政策和原始历史，权威状态在每次模型请求前单独注入。
 
         Args:
             state: 当前会话的真实消息和代码任务状态。
@@ -351,14 +379,21 @@ class Coordinator:
             新的 Chat Completions 消息列表；旧对话仅供理解，不作为当前授权。
         """
         prompt = (
-            "你是电商客服协调者，负责理解全部诉求并维护任务。每次调用一个工具。"
+            "你是与用户多轮交互的电商客服主 Agent，负责理解全部诉求、查询、解释、追问和维护任务。"
+            "可以一次调用多个只读业务工具，代码按顺序执行；含协调工具时只能调用一个，"
+            "批量更新或分派使用该工具的列表参数。"
             "未验证身份时先查找用户，缺少邮箱或姓名+邮编时直接用 reply 询问；用户只能服务一个账户。"
-            "首先用 update_tasks 提出本轮所有新增、修改、撤销，再用 complete_plan 结束计划；"
-            "需要立即分派时在 complete_plan 的 task_ids 中列出已有待执行或条件已满足的任务。"
-            "代码先独立判定用户确认并核验，再分派；"
-            "task_ids 不表示用户授权，不能包含待确认或已结束任务。"
+            "身份验证后可直接读取用户资料、订单详情和商品规格。订单不明时先自行查询定位；"
+            "只有多张订单都符合且确实无法区分时才询问用户，不创建没有 order_id 的订单写任务。"
+            "写操作必须由子 Agent 加载 Skill 后准备，协调者只能读取业务数据。"
+            "上一回复展示过且仍有效的待确认操作存在时，先用 update_tasks 提出本轮全部新增、"
+            "改口和撤销，再用 complete_plan 让代码独立判定用户原话、提交并核验。"
+            "没有这样的待确认操作时，可直接 reply 对话或用 dispatch_tasks 分派，"
+            "不需要空调 complete_plan；仍有可推进任务时不能提前回复。"
+            "complete_plan(task_ids=[...]) 可在一次决策中结束计划并分派已有任务。"
+            "其中不存在、重复或状态不符的分派项会单独说明，不影响当前原话的确认判定。"
+            "task_ids 不表示用户授权，新准备项须展示后等待确认。"
             "用户改口时必须在 complete_plan 之前更新旧任务，不能只据‘可以’提交。"
-            "此后用 dispatch_tasks 选择任务，或用 update_tasks 撤销已不需要的条件备用任务。"
             "条件保持自然语言，由你判断；条件满足时明确分派该任务，不再需要则撤销并说明原因。"
             "写任务按订单×动作类型聚合完整商品清单；同单不同动作逐个确认，先地址/支付后商品。"
             "每个任务提供完整 instruction、capability、action，订单动作还要 order_id。"
@@ -367,44 +402,84 @@ class Coordinator:
             "不能声明写任务完成，不能提交操作，用户确认只由独立判定器读取当前用户原话。"
             "reply 只能在所有任务完成、撤销、等待用户或失败后调用。"
             "show_task_ids为要展示待确认详情的任务，省略展示全部，空列表不展示。"
+            "协调工具返回变化摘要；当前完整任务清单只看本次请求附带的权威状态。"
+            "其中事实与执行记录只保留关键标识和结果摘要，需要业务明细时重新查询。"
             "任务结果与操作详情由代码生成，message_hint只作回复要点。\n"
             + self.gateway.skills.common_policy
             + "\n可分派能力：\n"
             + json.dumps(self.runner.registry.catalog(), ensure_ascii=False)
         )
-        return [
-            {"role": "system", "content": prompt},
-            *deepcopy(state.history),
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "tasks": state.tasks.snapshot(),
-                        "verified": state.session.user_id is not None,
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ]
+        return [{"role": "system", "content": prompt}, *deepcopy(state.history)]
 
-    def _schemas(self, context: CallContext, confirmed: bool) -> list[dict]:
-        """按身份和本轮阶段开放协调工具，不开放提交与核验。
+    @staticmethod
+    def _model_messages(state: ConversationState, work: TurnState) -> list[dict]:
+        """给内存入口的原始消息临时注入一份最新状态，不修改归档消息下标。
 
         Args:
-            context: 当前协调者的调用身份。
-            confirmed: 本轮是否已经完成独立确认判定。
+            state: 当前身份与完整可信任务，投影只用于模型输入。
+            work: 初始历史与本轮真实往返，base_messages 在整个轮次保持稳定。
 
         Returns:
-            当前可见的函数工具定义。
+            在当前用户原话之前插入一份精简状态的新消息列表。
         """
-        if context.session.user_id is None:
-            models = {"reply": Reply}
-        else:
-            models = {"reply": Reply} if confirmed else {"complete_plan": CompletePlan}
-        if context.session.user_id is not None:
-            models["update_tasks"] = UpdateTasks
-            if confirmed:
-                models["dispatch_tasks"] = DispatchTasks
+        snapshot = {
+            "role": "system",
+            "content": STATE_NOTICE
+            + json.dumps(
+                {
+                    "tasks": [task_view(task) for task in state.tasks.snapshot()],
+                    "verified": state.session.user_id is not None,
+                },
+                ensure_ascii=False,
+            ),
+        }
+        boundary = work.base_messages - 1
+        return [*work.messages[:boundary], snapshot, *work.messages[boundary:]]
+
+    @staticmethod
+    def _confirmation_view(decisions: list[dict]) -> list[dict]:
+        """精简模型可见的逐操作判定，完整核验证据仍保存在本轮状态中。
+
+        Args:
+            decisions: 含完整核验 expected、actual 和 operation 的内部确认结果。
+
+        Returns:
+            操作标识、判断、执行状态、原因与核验结论，不包含完整业务对象。
+        """
+        result = []
+        for decision in decisions:
+            item = {
+                key: deepcopy(decision[key])
+                for key in ("operation_id", "decision", "status", "reason", "error")
+                if key in decision
+            }
+            if "verification" in decision:
+                item["verification"] = {
+                    key: deepcopy(decision["verification"][key])
+                    for key in ("verified", "reason", "checked_fields")
+                    if key in decision["verification"]
+                }
+            result.append(item)
+        return result
+
+    def _schemas(self, state: ConversationState, work: TurnState) -> list[dict]:
+        """按身份和有效待确认展示开放工具，不开放提交与核验。
+
+        Args:
+            state: 当前会话与可信任务状态。
+            work: 本轮独立确认进度和上一回复的实际展示快照。
+
+        Returns:
+            当前可见的业务与协调函数工具定义。
+        """
+        context = CallContext(state.session, "coordinator", work.instance_id)
+        models = {"reply": Reply}
+        if state.session.user_id is not None:
+            models = {"update_tasks": UpdateTasks}
+            if not work.confirmed:
+                models["complete_plan"] = CompletePlan
+            if not self._requires_plan(state, work):
+                models.update(reply=Reply, dispatch_tasks=DispatchTasks)
         return self.gateway.schemas(context) + [
             {
                 "type": "function",
@@ -417,10 +492,16 @@ class Coordinator:
             for name, model in models.items()
         ]
 
-    @staticmethod
-    def _can_reply(state: ConversationState, work: TurnState) -> bool:
-        """身份验证前没有任务可推进，可直接回复；验证后须先完成本轮计划与确认判定。"""
-        return state.session.user_id is None or work.confirmed
+    def _requires_plan(self, state: ConversationState, work: TurnState) -> bool:
+        """仅对上一回复展示过且仍有效的待确认操作要求先处理本轮计划。"""
+        if work.confirmed or state.session.user_id is None:
+            return False
+        context = CallContext(state.session, "coordinator", work.instance_id)
+        return bool(self._eligible_confirmations(state, context, work.previous))
+
+    def _can_reply(self, state: ConversationState, work: TurnState) -> bool:
+        """允许身份追问或无有效旧授权时对话，任务可推进性由回复入口另行检查。"""
+        return not self._requires_plan(state, work)
 
     @staticmethod
     def _require_identity(state: ConversationState) -> None:
@@ -465,23 +546,18 @@ class Coordinator:
                     task.reason = f"旧操作已失效：{operation['status']}，需重新准备与展示"
                     task.reason_internal = False
 
-    async def _confirm(
-        self,
-        state: ConversationState,
-        context: CallContext,
-        user_message: str,
-        previous: list[dict],
-    ) -> list[dict]:
-        """只判定前一条实际回复中仍与当前任务修订一致的操作。
+    def _eligible_confirmations(
+        self, state: ConversationState, context: CallContext, previous: list[dict]
+    ) -> dict[str, tuple[Task, dict]]:
+        """选出上一回复中仍可由当前用户原话确认的操作。
 
         Args:
-            state: 已应用本轮任务修改的状态。
-            context: 代码提交、拒绝和核验使用的身份。
-            user_message: 当前用户原话。
-            previous: 上次成功发出的回复的展示快照。
+            state: 当前任务修订、状态和会话轮次。
+            context: 查询后端操作时使用的已验证身份。
+            previous: 上一回复实际展示的完整操作及参数快照。
 
         Returns:
-            按操作列出的判定、执行状态及核验结果，部分失败不覆盖其他结果。
+            操作 ID 到任务及展示快照的映射，过期、改口及未展示项不在其中。
         """
         eligible = {}
         for shown in previous:
@@ -503,6 +579,27 @@ class Coordinator:
                 and operation["preview"] == shown["preview"]
             ):
                 eligible[operation["operation_id"]] = (task, shown)
+        return eligible
+
+    async def _confirm(
+        self,
+        state: ConversationState,
+        context: CallContext,
+        user_message: str,
+        previous: list[dict],
+    ) -> list[dict]:
+        """只判定前一条实际回复中仍与当前任务修订一致的操作。
+
+        Args:
+            state: 已应用本轮任务修改的状态。
+            context: 代码提交、拒绝和核验使用的身份。
+            user_message: 当前用户原话。
+            previous: 上次成功发出的回复的展示快照。
+
+        Returns:
+            按操作列出的判定、执行状态及核验结果，部分失败不覆盖其他结果。
+        """
+        eligible = self._eligible_confirmations(state, context, previous)
         if not eligible:
             return []
         # 保留实际展示范围，避免撤销一项后把多项短回复误判为单项确认。
@@ -583,7 +680,7 @@ class Coordinator:
             task_ids: 模型明确选择的现有任务 ID，不能重复。
 
         Returns:
-            dispatched 的任务快照和 blocked 的占用原因。
+            dispatched 的任务状态摘要和 blocked 的占用原因。
 
         Raises:
             ValueError: 任务不存在、重复，或任务已结束、已经等待确认。
@@ -625,7 +722,43 @@ class Coordinator:
                     task.reason_internal = True
                     self._interrupted_records(state, task)
             raise
-        return {"dispatched": [task.to_dict() for task in selected], "blocked": blocked}
+        return {"dispatched": [task_brief(task.to_dict()) for task in selected], "blocked": blocked}
+
+    @staticmethod
+    def _plan_candidates(
+        state: ConversationState, task_ids: list[str]
+    ) -> tuple[list[str], list[dict]]:
+        """在确认已处理后逐项筛选合并分派选择，非法项不影响其他任务。
+
+        Args:
+            state: 确认、提交和核验后的可信任务状态。
+            task_ids: 结构已校验的模型分派列表；首次合法出现最多执行一次。
+
+        Returns:
+            可分派任务 ID 列表和每项被跳过的状态、原因；同单锁另由分派入口检查。
+        """
+        selected, blocked, seen = [], [], set()
+        for task_id in task_ids:
+            task = state.tasks.tasks.get(task_id)
+            reason = None
+            if task_id in seen:
+                reason = "分派任务 ID 重复，本次不重复执行"
+            elif task is None:
+                reason = "分派任务不存在"
+            elif task.status not in {"pending", "conditional"}:
+                reason = "任务状态不允许分派；只可分派待执行或条件已满足的任务"
+            seen.add(task_id)
+            if reason is not None:
+                blocked.append(
+                    {
+                        "task_id": task_id,
+                        "status": None if task is None else task.status,
+                        "reason": reason,
+                    }
+                )
+            else:
+                selected.append(task_id)
+        return selected, blocked
 
     @staticmethod
     def _dispatch_candidates(state: ConversationState, task_ids: list[str]) -> list[Task]:
@@ -920,7 +1053,7 @@ class Coordinator:
                 operation = self.gateway.get_operation(task_context, operation_id)
                 if operation["status"] != "prepared":
                     continue
-                content = operation_content(operation)
+                content = self.gateway.operation_content(task_context, operation)
                 lines.append(content)
                 displayed.append(
                     {

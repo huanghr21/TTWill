@@ -219,22 +219,22 @@ def test_write_completes_only_after_next_turn_confirmation_and_verification(runt
     def script(state):
         """首轮验证身份并派工，第二轮确认上一回复中的唯一操作。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
         yield tool("complete_plan", {})
         yield reply()
 
-    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#1"))
-    first = turn(coordinator, state, "我是 u1@example.com，请取消订单 #1")
+    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#W0000001"))
+    first = turn(coordinator, state, "我是 u1@example.com，请取消订单 #W0000001")
     assert first["tasks"][0]["status"] == "pending_confirm"
     assert len(first["displayed"]) == 1
     assert "已全部成功办理" not in first["reply"]
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
     second = turn(coordinator, state, "好的")
     assert second["tasks"][0]["status"] == "done"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
     assert any(
         record["kind"] == "verification" and record["status"] == "verified"
         for record in gateway.records
@@ -252,9 +252,11 @@ def test_same_order_requests_aggregate_items_and_confirm_actions_one_by_one(runt
             "update_tasks",
             {
                 "changes": [
-                    add_task("modify_pending_order_address", "#1", "收货地址改为北京新地址"),
-                    add_task("modify_pending_order_items", "#1", "衬衫从 a 换成 b"),
-                    add_task("modify_pending_order_items", "#1", "鞋从 x 换成 y，差价用 gift 支付"),
+                    add_task("modify_pending_order_address", "#W0000001", "收货地址改为北京新地址"),
+                    add_task("modify_pending_order_items", "#W0000001", "衬衫从 a 换成 b"),
+                    add_task(
+                        "modify_pending_order_items", "#W0000001", "鞋从 x 换成 y，差价用 gift 支付"
+                    ),
                 ]
             },
         )
@@ -268,11 +270,11 @@ def test_same_order_requests_aggregate_items_and_confirm_actions_one_by_one(runt
         yield reply()
 
     child_script = prepare_steps(
-        "modify_pending_order_address", {"order_id": "#1", **ADDRESS}
+        "modify_pending_order_address", {"order_id": "#W0000001", **ADDRESS}
     ) + prepare_steps(
         "modify_pending_order_items",
         {
-            "order_id": "#1",
+            "order_id": "#W0000001",
             "item_ids": ["a", "x"],
             "new_item_ids": ["b", "y"],
             "payment_method_id": "gift",
@@ -291,11 +293,13 @@ def test_same_order_requests_aggregate_items_and_confirm_actions_one_by_one(runt
     assert [task["status"] for task in second["tasks"]] == ["done", "pending_confirm"]
     assert len(second["displayed"]) == 1
     snapshot = backend.export_snapshot()
-    assert snapshot["orders"]["#1"]["address"] == ADDRESS
-    assert [item["item_id"] for item in snapshot["orders"]["#1"]["items"]] == ["a", "x"]
+    assert snapshot["orders"]["#W0000001"]["address"] == ADDRESS
+    assert [item["item_id"] for item in snapshot["orders"]["#W0000001"]["items"]] == ["a", "x"]
     third = turn(coordinator, state, "确认")
     assert all(task["status"] == "done" for task in third["tasks"])
-    assert [item["item_id"] for item in backend.export_snapshot()["orders"]["#1"]["items"]] == [
+    assert [
+        item["item_id"] for item in backend.export_snapshot()["orders"]["#W0000001"]["items"]
+    ] == [
         "b",
         "y",
     ]
@@ -307,7 +311,9 @@ def test_multiple_orders_require_explicit_scope_and_report_partial_commit_failur
     def script(state):
         """两单同时准备，连续两轮只完成计划并按代码状态回复。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1"), cancel_task("#4")]})
+        yield tool(
+            "update_tasks", {"changes": [cancel_task("#W0000001"), cancel_task("#W0000004")]}
+        )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
@@ -316,28 +322,32 @@ def test_multiple_orders_require_explicit_scope_and_report_partial_commit_failur
         yield tool("complete_plan", {})
         yield reply()
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
-    first = turn(coordinator, state, "取消 #1 和 #4")
+    coordinator, state, _, _, _ = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
+    first = turn(coordinator, state, "取消 #W0000001 和 #W0000004")
     assert len(first["displayed"]) == 2
     ambiguous = turn(coordinator, state, "好的")
     assert all(task["status"] == "pending_confirm" for task in ambiguous["tasks"])
     assert all(
         backend.export_snapshot()["orders"][order_id]["status"] == "pending"
-        for order_id in ("#1", "#4")
+        for order_id in ("#W0000001", "#W0000004")
     )
     with backend.engine.begin() as connection:
-        order = connection.execute(select(orders.c.data).where(orders.c.id == "#4")).scalar_one()
+        order = connection.execute(
+            select(orders.c.data).where(orders.c.id == "#W0000004")
+        ).scalar_one()
         order["status"] = "delivered"
-        connection.execute(update(orders).where(orders.c.id == "#4").values(data=order))
+        connection.execute(update(orders).where(orders.c.id == "#W0000004").values(data=order))
     confirmed = turn(coordinator, state, "全部确认")
     tasks = by_order(confirmed)
-    assert tasks["#1"]["status"] == "done"
-    assert tasks["#4"]["status"] == "failed"
-    assert tasks["#4"]["reason_internal"] is False
-    assert tasks["#4"]["reason"] in confirmed["reply"]
+    assert tasks["#W0000001"]["status"] == "done"
+    assert tasks["#W0000004"]["status"] == "failed"
+    assert tasks["#W0000004"]["reason_internal"] is False
+    assert tasks["#W0000004"]["reason"] in confirmed["reply"]
     assert len(confirmed["confirmation_results"]) == 2
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
-    assert backend.export_snapshot()["orders"]["#4"]["status"] == "delivered"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "delivered"
 
 
 def test_changed_request_invalidates_old_operation_before_confirmation(runtime, backend):
@@ -346,7 +356,7 @@ def test_changed_request_invalidates_old_operation_before_confirmation(runtime, 
     def script(state):
         """第二轮将原任务修改到另一订单后，再完成计划和重新准备。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
@@ -354,7 +364,11 @@ def test_changed_request_invalidates_old_operation_before_confirmation(runtime, 
             "update_tasks",
             {
                 "changes": [
-                    {**cancel_task("#4"), "operation": "update", "task_id": task_ids(state)[0]}
+                    {
+                        **cancel_task("#W0000004"),
+                        "operation": "update",
+                        "task_id": task_ids(state)[0],
+                    }
                 ]
             },
         )
@@ -362,17 +376,19 @@ def test_changed_request_invalidates_old_operation_before_confirmation(runtime, 
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
-    first = turn(coordinator, state, "取消 #1")
+    coordinator, state, _, _, _ = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
+    first = turn(coordinator, state, "取消 #W0000001")
     old_operation = first["tasks"][0]["operation_ids"][0]
-    second = turn(coordinator, state, "好的，不过改为取消 #4，#1 保留")
+    second = turn(coordinator, state, "好的，不过改为取消 #W0000004，#W0000001 保留")
     assert backend.get_operation("u1", operation_id=old_operation)["status"] == "rejected"
     assert second["tasks"][0]["revision"] == 2
     assert second["tasks"][0]["status"] == "pending_confirm"
-    assert second["tasks"][0]["order_id"] == "#4"
+    assert second["tasks"][0]["order_id"] == "#W0000004"
     assert all(
         backend.export_snapshot()["orders"][order_id]["status"] == "pending"
-        for order_id in ("#1", "#4")
+        for order_id in ("#W0000001", "#W0000004")
     )
 
 
@@ -380,28 +396,34 @@ def test_operation_omitted_from_latest_reply_cannot_use_later_confirmation(runti
     """旧待确认任务保留，但仅最近一次回复展示的操作能获得下一轮授权。"""
 
     def script(state):
-        """第二次回复只展示 #4，第三轮确认后也不重新展示 #1。"""
+        """第二次回复只展示 #W0000004，第三轮确认后也不重新展示 #W0000001。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1"), cancel_task("#4")]})
+        yield tool(
+            "update_tasks", {"changes": [cancel_task("#W0000001"), cancel_task("#W0000004")]}
+        )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
         yield tool("complete_plan", {})
-        yield reply([task.id for task in state.tasks.tasks.values() if task.order_id == "#4"])
+        yield reply(
+            [task.id for task in state.tasks.tasks.values() if task.order_id == "#W0000004"]
+        )
         yield tool("complete_plan", {})
         yield reply([])
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
-    turn(coordinator, state, "取消 #1 和 #4")
+    coordinator, state, _, _, _ = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
+    turn(coordinator, state, "取消 #W0000001 和 #W0000004")
     second = turn(coordinator, state, "好的")
     assert len(second["displayed"]) == 1
     third = turn(coordinator, state, "好的")
     tasks = by_order(third)
-    assert tasks["#1"]["status"] == "pending_confirm"
-    assert tasks["#4"]["status"] == "done"
+    assert tasks["#W0000001"]["status"] == "pending_confirm"
+    assert tasks["#W0000004"]["status"] == "done"
     assert third["displayed"] == []
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
-    assert backend.export_snapshot()["orders"]["#4"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "cancelled"
 
 
 def test_user_rejection_and_cancelled_conditional_fallback_do_not_write(runtime, backend):
@@ -414,10 +436,10 @@ def test_user_rejection_and_cancelled_conditional_fallback_do_not_write(runtime,
             "update_tasks",
             {
                 "changes": [
-                    add_task("exchange_delivered_order_items", "#2", "衬衫 a 换成 b"),
+                    add_task("exchange_delivered_order_items", "#W0000002", "衬衫 a 换成 b"),
                     add_task(
                         "return_delivered_order_items",
-                        "#2",
+                        "#W0000002",
                         "无法换货时退货",
                         condition="换货无法办理",
                     ),
@@ -441,7 +463,12 @@ def test_user_rejection_and_cancelled_conditional_fallback_do_not_write(runtime,
 
     child_script = prepare_steps(
         "exchange_delivered_order_items",
-        {"order_id": "#2", "item_ids": ["a"], "new_item_ids": ["b"], "payment_method_id": "card"},
+        {
+            "order_id": "#W0000002",
+            "item_ids": ["a"],
+            "new_item_ids": ["b"],
+            "payment_method_id": "card",
+        },
         skill="exchange_delivered_order",
     )
     coordinator, state, _, _, _ = runtime(script, child_script)
@@ -449,7 +476,7 @@ def test_user_rejection_and_cancelled_conditional_fallback_do_not_write(runtime,
     assert [task["status"] for task in first["tasks"]] == ["pending_confirm", "conditional"]
     second = turn(coordinator, state, "不用了")
     assert all(task["status"] == "cancelled" for task in second["tasks"])
-    assert backend.export_snapshot()["orders"]["#2"]["status"] == "delivered"
+    assert backend.export_snapshot()["orders"]["#W0000002"]["status"] == "delivered"
 
 
 def test_unverified_dispatch_and_model_owned_completion_are_blocked(runtime, backend):
@@ -457,24 +484,24 @@ def test_unverified_dispatch_and_model_owned_completion_are_blocked(runtime, bac
 
     def script(state):
         """尝试越权后使用合法工具继续，使护栏拒绝本身不丢失本轮任务。"""
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         assert state.tasks.tasks == {}
         yield tool("dispatch_tasks", {"task_ids": ["forged"]})
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [{**cancel_task("#1"), "status": "done"}]})
+        yield tool("update_tasks", {"changes": [{**cancel_task("#W0000001"), "status": "done"}]})
         assert state.tasks.tasks == {}
         yield tool("commit", {"operation_id": "forged", "expected_args": {}})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#1"))
-    result = turn(coordinator, state, "取消 #1")
+    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#W0000001"))
+    result = turn(coordinator, state, "取消 #W0000001")
     assert len(result["tasks"]) == 1
     assert result["tasks"][0]["status"] == "pending_confirm"
     assert not any(record["kind"] == "commit" for record in gateway.records)
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_one_subagent_failure_does_not_abort_another_order(runtime, backend):
@@ -483,18 +510,21 @@ def test_one_subagent_failure_does_not_abort_another_order(runtime, backend):
     def script(state):
         """同时分派两个订单，在各任务独立结束后按实际状态回复。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1"), cancel_task("#4")]})
+        yield tool(
+            "update_tasks", {"changes": [cancel_task("#W0000001"), cancel_task("#W0000004")]}
+        )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
 
     coordinator, state, gateway, _, _ = runtime(
-        script, [*cancel_steps("#1")[:-1], LLMError("第一单模型失败"), *cancel_steps("#4")]
+        script,
+        [*cancel_steps("#W0000001")[:-1], LLMError("第一单模型失败"), *cancel_steps("#W0000004")],
     )
-    result = turn(coordinator, state, "取消 #1 和 #4")
+    result = turn(coordinator, state, "取消 #W0000001 和 #W0000004")
     tasks = by_order(result)
-    assert tasks["#1"]["status"] == "failed"
-    assert tasks["#4"]["status"] == "pending_confirm"
+    assert tasks["#W0000001"]["status"] == "failed"
+    assert tasks["#W0000004"]["status"] == "pending_confirm"
     assert len(result["displayed"]) == 1
     prepared = next(record for record in gateway.records if record.get("status") == "prepared")
     assert (
@@ -502,7 +532,7 @@ def test_one_subagent_failure_does_not_abort_another_order(runtime, backend):
     )
     assert all(
         backend.export_snapshot()["orders"][order_id]["status"] == "pending"
-        for order_id in ("#1", "#4")
+        for order_id in ("#W0000001", "#W0000004")
     )
 
 
@@ -510,22 +540,22 @@ def test_subagent_cannot_prepare_another_order_under_current_task(runtime, backe
     """子 Agent 即使获准操作另一张本人订单，也不能把它挂到错误任务中等待确认。"""
 
     def script(state):
-        """只分派 #1 请求，子 Agent 的 #4 操作由结果关联检查拒绝。"""
+        """只分派 #W0000001 请求，子 Agent 的 #W0000004 操作由结果关联检查拒绝。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#4"))
-    result = turn(coordinator, state, "取消 #1")
+    coordinator, state, gateway, _, _ = runtime(script, cancel_steps("#W0000004"))
+    result = turn(coordinator, state, "取消 #W0000001")
     assert result["tasks"][0]["status"] == "failed"
     assert result["displayed"] == []
     prepared = next(record for record in gateway.records if record.get("status") == "prepared")
     assert (
         backend.get_operation("u1", operation_id=prepared["operation_id"])["status"] == "rejected"
     )
-    assert backend.export_snapshot()["orders"]["#4"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "pending"
 
 
 def test_unfinished_task_cannot_reply_and_fails_at_round_limit(runtime, backend):
@@ -534,18 +564,18 @@ def test_unfinished_task_cannot_reply_and_fails_at_round_limit(runtime, backend)
     def script(state):
         """建立任务后跳过分派直接请求回复，以验证未完成检查和预算退出。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield reply()
 
     coordinator, state, gateway, fake, child = runtime(script, [], max_rounds=4)
-    result = turn(coordinator, state, "取消 #1")
+    result = turn(coordinator, state, "取消 #W0000001")
     assert result["rounds"] == 4
     assert len(fake.requests) == 4
     assert child.requests == []
     assert result["tasks"][0]["status"] == "failed"
     assert "上限" in result["tasks"][0]["reason"]
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
     events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
     assert any(
         event["kind"] == "guard"
@@ -561,13 +591,15 @@ def test_removing_one_of_two_displayed_operations_does_not_expand_ambiguous_cons
     """已展示两项时，即使本轮撤销一项，“好的”仍不能自动授权剩余项。"""
 
     def script(state):
-        """第二轮先撤销 #1，再用完整的上一回复展示范围判定简短同意。"""
+        """第二轮先撤销 #W0000001，再用完整的上一回复展示范围判定简短同意。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1"), cancel_task("#4")]})
+        yield tool(
+            "update_tasks", {"changes": [cancel_task("#W0000001"), cancel_task("#W0000004")]}
+        )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
-        first = next(task for task in state.tasks.tasks.values() if task.order_id == "#1")
+        first = next(task for task in state.tasks.tasks.values() if task.order_id == "#W0000001")
         yield tool(
             "update_tasks",
             {"changes": [{"operation": "cancel", "task_id": first.id, "reason": "撤销第一项"}]},
@@ -575,24 +607,26 @@ def test_removing_one_of_two_displayed_operations_does_not_expand_ambiguous_cons
         yield tool("complete_plan", {})
         yield reply()
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
-    first = turn(coordinator, state, "取消 #1 和 #4")
+    coordinator, state, _, _, _ = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
+    first = turn(coordinator, state, "取消 #W0000001 和 #W0000004")
     assert len(first["displayed"]) == 2
     second = turn(coordinator, state, "好的")
     tasks = by_order(second)
-    assert tasks["#1"]["status"] == "cancelled"
-    assert tasks["#4"]["status"] == "pending_confirm"
+    assert tasks["#W0000001"]["status"] == "cancelled"
+    assert tasks["#W0000004"]["status"] == "pending_confirm"
     assert all(
         backend.export_snapshot()["orders"][order_id]["status"] == "pending"
-        for order_id in ("#1", "#4")
+        for order_id in ("#W0000001", "#W0000004")
     )
 
 
 @pytest.mark.parametrize(
     ("query", "args", "expected_status"),
     [
-        ("get_order_details", {"order_id": "#1"}, "done"),
-        ("get_order_details", {"order_id": "#4"}, "failed"),
+        ("get_order_details", {"order_id": "#W0000001"}, "done"),
+        ("get_order_details", {"order_id": "#W0000004"}, "failed"),
         ("get_user_details", {"user_id": "u1"}, "failed"),
     ],
 )
@@ -602,11 +636,11 @@ def test_read_task_requires_facts_for_its_own_action_and_order(
     """查询有结果还不够，工具类型和目标订单必须匹配当前只读任务。"""
 
     def script(state):
-        """分派 #1 订单查询任务，代码检查返回事实是否回答了这个请求。"""
+        """分派 #W0000001 订单查询任务，代码检查返回事实是否回答了这个请求。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield tool(
             "update_tasks",
-            {"changes": [add_task("get_order_details", "#1", "查询订单 #1 的状态")]},
+            {"changes": [add_task("get_order_details", "#W0000001", "查询订单 #W0000001 的状态")]},
         )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
@@ -616,7 +650,7 @@ def test_read_task_requires_facts_for_its_own_action_and_order(
         script,
         [tool(query, args), tool("finish", {"missing": [], "message_hint": "订单已查询"})],
     )
-    result = turn(coordinator, state, "查询 #1")
+    result = turn(coordinator, state, "查询 #W0000001")
     assert result["tasks"][0]["status"] == expected_status
     assert result["tasks"][0]["facts"]
     assert result["tasks"][0]["operation_ids"] == []
@@ -632,11 +666,11 @@ def test_interruption_after_prepare_keeps_failed_task_and_operation_evidence(
     def script(state):
         """建立并分派任务，子 Agent 准备之后的异常终止本轮处理。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
 
-    coordinator, state, _, _, child = runtime(script, cancel_steps("#1"))
+    coordinator, state, _, _, child = runtime(script, cancel_steps("#W0000001"))
     original_send = child.send
 
     async def interrupt_after_prepare(model, request, timeout_seconds):
@@ -647,7 +681,7 @@ def test_interruption_after_prepare_keeps_failed_task_and_operation_evidence(
 
     child.send = interrupt_after_prepare
     with pytest.raises(error_type):
-        turn(coordinator, state, "取消 #1")
+        turn(coordinator, state, "取消 #W0000001")
     task = next(iter(state.tasks.tasks.values()))
     assert task.status == "failed"
     assert task.reason
@@ -655,8 +689,8 @@ def test_interruption_after_prepare_keeps_failed_task_and_operation_evidence(
     assert task.actions
     operation = backend.get_operation("u1", operation_id=task.operation_ids[0])
     assert operation["status"] == "rejected"
-    assert operation["args"]["order_id"] == "#1"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert operation["args"]["order_id"] == "#W0000001"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_coordinator_read_failure_after_subagent_finish_preserves_and_cleans_operation(
@@ -667,11 +701,11 @@ def test_coordinator_read_failure_after_subagent_finish_preserves_and_cleans_ope
     def script(state):
         """分派真实写任务，由协调代码接收结果时发生一次存取异常。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
 
-    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1"))
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#W0000001"))
     original_get_operation = gateway.get_operation
     failed = False
 
@@ -685,7 +719,7 @@ def test_coordinator_read_failure_after_subagent_finish_preserves_and_cleans_ope
 
     monkeypatch.setattr(gateway, "get_operation", fail_first_coordinator_read)
     with pytest.raises(OSError, match="首次读取操作失败"):
-        turn(coordinator, state, "取消 #1")
+        turn(coordinator, state, "取消 #W0000001")
     assert failed is True
     assert len(child.requests) == 3
     task = next(iter(state.tasks.tasks.values()))
@@ -695,7 +729,7 @@ def test_coordinator_read_failure_after_subagent_finish_preserves_and_cleans_ope
     assert task.actions
     operation = backend.get_operation("u1", operation_id=task.operation_ids[0])
     assert operation["status"] == "rejected"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_round_limit_explains_stop_and_keeps_prepared_operation_for_confirmation(runtime, backend):
@@ -704,14 +738,14 @@ def test_round_limit_explains_stop_and_keeps_prepared_operation_for_confirmation
     def script(state):
         """首轮预算止于分派，第二个用户轮次仍可确认已经展示的准备项。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield tool("complete_plan", {})
         yield reply()
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1"), max_rounds=4)
-    first = turn(coordinator, state, "取消 #1")
+    coordinator, state, _, _, _ = runtime(script, cancel_steps("#W0000001"), max_rounds=4)
+    first = turn(coordinator, state, "取消 #W0000001")
     assert first["rounds"] == 4
     assert first["tasks"][0]["status"] == "pending_confirm"
     assert "上限" not in first["reply"]
@@ -730,20 +764,20 @@ def test_cancellation_before_subagent_start_does_not_leave_selected_task_running
     def script(state):
         """产生分派响应时安排外层取消，使取消先于新建子协程运行。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
 
-    coordinator, state, _, _, child = runtime(script, cancel_steps("#1"))
+    coordinator, state, _, _, child = runtime(script, cancel_steps("#W0000001"))
     with pytest.raises(asyncio.CancelledError):
-        turn(coordinator, state, "取消 #1")
+        turn(coordinator, state, "取消 #W0000001")
     task = next(iter(state.tasks.tasks.values()))
     assert child.requests == []
     assert task.status == "failed"
     assert task.reason
     assert task.operation_ids == []
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 @pytest.mark.parametrize("plain_text", [True, False])
@@ -771,17 +805,15 @@ def test_unverified_complete_plan_cannot_authorize_later_dispatch(runtime):
     """缺少身份时即使模型伪造 complete_plan，也不能提前完成确认阶段。"""
 
     def script(state):
-        """伪造计划结束后再验证身份，直接分派仍须被原有顺序护栏拒绝。"""
+        """伪造计划结束后再验证身份，合法计划仍应能完成，未验证调用不写确认进度。"""
         yield tool("complete_plan", {})
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
-        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
-        yield tool("complete_plan", {})
-        yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
+        yield tool("complete_plan", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1"))
-    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #1")
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#W0000001"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #W0000001")
     assert result["tasks"][0]["status"] == "pending_confirm"
     assert len(child.requests) == 3
     reasons = [
@@ -790,28 +822,26 @@ def test_unverified_complete_plan_cannot_authorize_later_dispatch(runtime):
         if event["kind"] == "guard"
     ]
     assert "请先验证用户身份" in reasons
-    assert "先提出所有任务修改并调用 complete_plan，再分派" in reasons
+    assert "本轮已经判定过用户确认" not in reasons
 
 
-def test_verified_plain_text_requires_complete_plan(runtime):
-    """已验证后直接输出文本仍被拒绝，完成计划后才能按同一回复路径返回。"""
+def test_verified_plain_text_without_pending_confirmation_can_reply(runtime):
+    """已验证但无待确认操作和可推进任务时，纯文本直接按回复处理。"""
     message = "请告诉我您需要办理的业务。"
 
     def script(state):
-        """先违反计划顺序，再按原有协议结束计划并返回相同客服文本。"""
+        """身份验证后直接输出客服文本，不插入空计划调用。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield text_response(message)
-        yield tool("complete_plan", {})
         yield text_response(message)
 
     coordinator, state, gateway, fake, _ = runtime(script, [])
     result = turn(coordinator, state, "我的邮箱是 u1@example.com")
-    assert result["reply"] == message and result["rounds"] == 4
-    assert len(fake.requests) == 4 and result["tasks"] == []
+    assert result["reply"] == message and result["rounds"] == 2
+    assert len(fake.requests) == 2 and result["tasks"] == []
     events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
     assert (
         sum(event["name"] == "coordinator_format" and event["event"] == "end" for event in events)
-        == 1
+        == 0
     )
 
 
@@ -822,14 +852,14 @@ def test_actionable_task_cannot_reply_early_and_internal_reason_stays_hidden(run
     def script(state):
         """首轮不分派使任务超限，下一轮只读取其失败状态。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {})
         yield text_response("已经办理完成。") if plain_text else reply()
         yield tool("complete_plan", {})
         yield reply()
 
     coordinator, state, gateway, _, child = runtime(script, [], max_rounds=4)
-    first = turn(coordinator, state, "请取消 #1")
+    first = turn(coordinator, state, "请取消 #W0000001")
     task = first["tasks"][0]
     assert task["status"] == "failed" and task["reason_internal"] is True
     assert "达到本轮上限 4" in task["reason"]
@@ -850,7 +880,9 @@ def test_dispatched_query_receives_verified_identity(runtime):
     def script(state):
         """验证身份后分派一项读取订单的任务。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [add_task("get_order_details", "#1", "查询订单")]})
+        yield tool(
+            "update_tasks", {"changes": [add_task("get_order_details", "#W0000001", "查询订单")]}
+        )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
@@ -858,11 +890,11 @@ def test_dispatched_query_receives_verified_identity(runtime):
     coordinator, state, _, _, child = runtime(
         script,
         [
-            tool("get_order_details", {"order_id": "#1"}),
+            tool("get_order_details", {"order_id": "#W0000001"}),
             tool("finish", {"missing": [], "message_hint": "已查询订单"}),
         ],
     )
-    result = turn(coordinator, state, "邮箱 u1@example.com，帮我查询订单 #1")
+    result = turn(coordinator, state, "邮箱 u1@example.com，帮我查询订单 #W0000001")
     instruction = json.loads(child.requests[0]["messages"][1]["content"])["instruction"]
     assert "用户身份已由协调者验证为 u1，不要再要求用户验证身份" in instruction
     assert result["tasks"][0]["status"] == "done"
@@ -876,25 +908,26 @@ def test_task_change_clears_internal_reason_visibility(runtime, operation):
     def script(state):
         """先使待办超限，后续按用户改口更新或撤销同一任务。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         task_id = task_ids(state)[0]
         change = {"operation": operation, "task_id": task_id}
         if operation == "cancel":
             change["reason"] = "用户决定保留订单"
         else:
-            change.update({**cancel_task("#1"), "operation": "update", "task_id": task_id})
+            change.update({**cancel_task("#W0000001"), "operation": "update", "task_id": task_id})
+            change["instruction"] = "取消订单 #W0000001，取消原因改为重复购买"
         yield tool("update_tasks", {"changes": [change]})
         yield tool("complete_plan", {})
         if operation == "update":
             yield tool("dispatch_tasks", {"task_ids": [task_id]})
         yield reply()
 
-    coordinator, state, _, _, _ = runtime(script, cancel_steps("#1"), max_rounds=2)
-    first = turn(coordinator, state, "取消订单 #1")
+    coordinator, state, _, _, _ = runtime(script, cancel_steps("#W0000001"), max_rounds=2)
+    first = turn(coordinator, state, "取消订单 #W0000001")
     assert first["tasks"][0]["reason_internal"] is True
     coordinator.max_rounds = 4
     second = turn(
-        coordinator, state, "按刚才说的重新办理" if operation == "update" else "先保留订单"
+        coordinator, state, "取消原因改成重复购买" if operation == "update" else "先保留订单"
     )
     assert second["tasks"][0]["reason_internal"] is False
     assert STOP_NOTICE not in second["reply"]
@@ -911,12 +944,14 @@ def test_model_cannot_write_internal_reason_flag(runtime):
     def script(state):
         """向合法新增任务混入代码字段，随后按空任务正常结束。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [{**cancel_task("#1"), "reason_internal": False}]})
+        yield tool(
+            "update_tasks", {"changes": [{**cancel_task("#W0000001"), "reason_internal": False}]}
+        )
         yield tool("complete_plan", {})
         yield reply()
 
     coordinator, state, gateway, _, _ = runtime(script, [])
-    result = turn(coordinator, state, "请取消 #1")
+    result = turn(coordinator, state, "请取消 #W0000001")
     assert result["tasks"] == []
     events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
     assert any(
@@ -933,8 +968,8 @@ def test_older_task_snapshot_defaults_to_visible_business_reason():
             "id": "old-task",
             "capability": "order_service",
             "action": "cancel_pending_order",
-            "instruction": "取消订单 #1",
-            "order_id": "#1",
+            "instruction": "取消订单 #W0000001",
+            "order_id": "#W0000001",
             "status": "failed",
             "reason": "订单已发货，不能取消",
         }
@@ -975,25 +1010,30 @@ def test_complete_plan_can_prepare_selected_task_in_one_decision(runtime, backen
     def script(state):
         """创建任务后一次完成计划与派工，再按实际准备结果展示。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [{**cancel_task("#1"), "condition": condition}]})
+        yield tool(
+            "update_tasks", {"changes": [{**cancel_task("#W0000001"), "condition": condition}]}
+        )
         yield tool("complete_plan", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, gateway, fake, child = runtime(script, cancel_steps("#1"))
-    result = turn(coordinator, state, "邮箱 u1@example.com，确认取消订单 #1")
+    coordinator, state, gateway, fake, child = runtime(script, cancel_steps("#W0000001"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，确认取消订单 #W0000001")
     assert result["rounds"] == len(fake.requests) == 4
     assert len(child.requests) == 3
     assert result["tasks"][0]["status"] == "pending_confirm"
     assert len(result["displayed"]) == 1 and result["confirmation_results"] == []
     assert not any(record["kind"] == "commit" for record in gateway.records)
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
     outcome = json.loads(
         [message for message in fake.requests[-1]["messages"] if message["role"] == "tool"][-1][
             "content"
         ]
     )
     assert outcome["confirmation_results"] == [] and outcome["blocked"] == []
-    assert outcome["tasks"] == outcome["dispatched"] == result["tasks"]
+    assert "tasks" not in outcome
+    assert outcome["dispatched"] == [
+        {"task_id": result["tasks"][0]["id"], "status": "pending_confirm", "reason": None}
+    ]
 
 
 @pytest.mark.parametrize("arguments", [{}, {"task_ids": []}])
@@ -1003,7 +1043,7 @@ def test_complete_plan_without_selection_keeps_separate_dispatch(runtime, backen
     def script(state):
         """在完整计划结果之后才显式发起业务子任务。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", arguments)
         assert child.requests == []
         outcome = json.loads(
@@ -1011,15 +1051,15 @@ def test_complete_plan_without_selection_keeps_separate_dispatch(runtime, backen
                 "content"
             ]
         )
-        assert "dispatched" not in outcome and "blocked" not in outcome
+        assert outcome == {"confirmation_results": [], "dispatched": [], "blocked": []}
         yield tool("dispatch_tasks", {"task_ids": task_ids(state)})
         yield reply()
 
-    coordinator, state, _, fake, child = runtime(script, cancel_steps("#1"))
-    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #1")
+    coordinator, state, _, fake, child = runtime(script, cancel_steps("#W0000001"))
+    result = turn(coordinator, state, "邮箱 u1@example.com，请取消 #W0000001")
     assert result["rounds"] == len(fake.requests) == 5
     assert result["tasks"][0]["status"] == "pending_confirm"
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
 def test_complete_plan_confirms_previous_action_before_dispatching_same_order(runtime, backend):
@@ -1032,9 +1072,11 @@ def test_complete_plan_confirms_previous_action_before_dispatching_same_order(ru
             "update_tasks",
             {
                 "changes": [
-                    add_task("modify_pending_order_address", "#1", "收货地址改为北京新地址"),
+                    add_task("modify_pending_order_address", "#W0000001", "收货地址改为北京新地址"),
                     add_task(
-                        "modify_pending_order_items", "#1", "衬衫从 a 换成 b，差价用 gift 支付"
+                        "modify_pending_order_items",
+                        "#W0000001",
+                        "衬衫从 a 换成 b，差价用 gift 支付",
                     ),
                 ]
             },
@@ -1046,10 +1088,15 @@ def test_complete_plan_confirms_previous_action_before_dispatching_same_order(ru
         yield tool("complete_plan", {"task_ids": []})
         yield reply()
 
-    children = prepare_steps("modify_pending_order_address", {"order_id": "#1", **ADDRESS})
+    children = prepare_steps("modify_pending_order_address", {"order_id": "#W0000001", **ADDRESS})
     children += prepare_steps(
         "modify_pending_order_items",
-        {"order_id": "#1", "item_ids": ["a"], "new_item_ids": ["b"], "payment_method_id": "gift"},
+        {
+            "order_id": "#W0000001",
+            "item_ids": ["a"],
+            "new_item_ids": ["b"],
+            "payment_method_id": "gift",
+        },
     )
     coordinator, state, gateway, fake, _ = runtime(script, children)
     first = turn(coordinator, state, "先改地址，再换商品规格")
@@ -1068,8 +1115,8 @@ def test_complete_plan_confirms_previous_action_before_dispatching_same_order(ru
         second["confirmation_results"][0]["operation_id"] == first["displayed"][0]["operation_id"]
     )
     snapshot = backend.export_snapshot()
-    assert snapshot["orders"]["#1"]["address"] == ADDRESS
-    assert snapshot["orders"]["#1"]["items"][0]["item_id"] == "a"
+    assert snapshot["orders"]["#W0000001"]["address"] == ADDRESS
+    assert snapshot["orders"]["#W0000001"]["items"][0]["item_id"] == "a"
     records = gateway.records
     committed = next(index for index, record in enumerate(records) if record["kind"] == "commit")
     prepared = next(
@@ -1080,30 +1127,25 @@ def test_complete_plan_confirms_previous_action_before_dispatching_same_order(ru
     assert committed < prepared
     third = turn(coordinator, state, "确认")
     assert all(task["status"] == "done" for task in third["tasks"])
-    assert backend.export_snapshot()["orders"]["#1"]["items"][0]["item_id"] == "b"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["items"][0]["item_id"] == "b"
 
 
-@pytest.mark.parametrize(
-    "invalid_selection", ["unknown", "duplicate", "prepared", "string", "null", "number", "object"]
-)
-def test_invalid_plan_dispatch_selection_precedes_confirmation_side_effects(
+@pytest.mark.parametrize("invalid_selection", ["string", "null", "number", "object"])
+def test_invalid_plan_parameter_structure_precedes_confirmation_side_effects(
     runtime, backend, monkeypatch, invalid_selection
 ):
-    """非法分派列表先于确认被拒，先前准备项未提交，修正请求后同轮仍可正常继续。"""
+    """工具参数结构不合法时整次拒绝，修正结构后同轮仍可独立处理用户确认。"""
     confirmations = []
 
     def script(state):
         """先展示第一单，次轮新增第二单并先给出一项不合法的合并调用。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {"task_ids": task_ids(state)})
         yield reply()
-        yield tool("update_tasks", {"changes": [cancel_task("#4")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000004")]})
         selected = task_ids(state, status="pending")[0]
         candidates = {
-            "unknown": ["missing-task"],
-            "duplicate": [selected, selected],
-            "prepared": [task_ids(state, status="pending_confirm")[0]],
             "string": selected,
             "null": None,
             "number": [7],
@@ -1111,12 +1153,14 @@ def test_invalid_plan_dispatch_selection_precedes_confirmation_side_effects(
         }
         yield tool("complete_plan", {"task_ids": candidates[invalid_selection]})
         assert len(confirmations) == 1 and len(child.requests) == 3
-        assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+        assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
         assert not any(record["kind"] == "commit" for record in gateway.records)
         yield tool("complete_plan", {"task_ids": [selected]})
         yield reply()
 
-    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
+    coordinator, state, gateway, _, child = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
     original_confirm = coordinator._confirm
 
     async def observe_confirmation(state, context, user_message, previous):
@@ -1135,26 +1179,24 @@ def test_invalid_plan_dispatch_selection_precedes_confirmation_side_effects(
         return await original_confirm(state, context, user_message, previous)
 
     monkeypatch.setattr(coordinator, "_confirm", observe_confirmation)
-    first = turn(coordinator, state, "取消 #1")
+    first = turn(coordinator, state, "取消 #W0000001")
     second = turn(coordinator, state, "确认")
     assert second["rounds"] == 4
-    assert confirmations == [("取消 #1", []), ("确认", first["displayed"])]
+    assert confirmations == [("取消 #W0000001", []), ("确认", first["displayed"])]
     assert [task["status"] for task in second["tasks"]] == ["done", "pending_confirm"]
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "cancelled"
-    assert backend.export_snapshot()["orders"]["#4"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
+    assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "pending"
     assert sum(record["kind"] == "commit" for record in gateway.records) == 1
 
 
-def test_combined_plan_keeps_early_dispatch_and_multiple_tool_calls_blocked(runtime, backend):
-    """合并入口仍只接受一个工具调用，不允许先分派，也不执行同响应中的多个工具。"""
+def test_combined_plan_keeps_multiple_coordination_calls_blocked(runtime, backend):
+    """同一响应混含多个协调工具时整条拒绝，不能执行其中任何准备动作。"""
 
     def script(state):
-        """先产生两种协议错误，再用合法合并调用准备并展示操作。"""
+        """先产生协调工具批次错误，再用合法合并调用准备并展示操作。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         selection = {"task_ids": task_ids(state)}
-        yield tool("dispatch_tasks", selection)
-        assert child.requests == []
         combined = tool("complete_plan", selection)
         combined["choices"][0]["message"]["tool_calls"].extend(
             tool("dispatch_tasks", selection)["choices"][0]["message"]["tool_calls"]
@@ -1164,9 +1206,9 @@ def test_combined_plan_keeps_early_dispatch_and_multiple_tool_calls_blocked(runt
         yield tool("complete_plan", selection)
         yield reply()
 
-    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1"))
-    result = turn(coordinator, state, "取消 #1")
-    assert result["rounds"] == 6 and len(child.requests) == 3
+    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#W0000001"))
+    result = turn(coordinator, state, "取消 #W0000001")
+    assert result["rounds"] == 5 and len(child.requests) == 3
     assert result["tasks"][0]["status"] == "pending_confirm"
     events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
     guards = [
@@ -1176,34 +1218,35 @@ def test_combined_plan_keeps_early_dispatch_and_multiple_tool_calls_blocked(runt
         and event["event"] == "end"
         and event["name"].startswith("coordinator_")
     ]
-    assert guards == ["coordinator_tool", "coordinator_format"]
-    assert backend.export_snapshot()["orders"]["#1"]["status"] == "pending"
+    assert guards == ["coordinator_format"]
+    assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
 
 
-def test_completed_task_in_plan_selection_rejects_entire_batch(runtime, backend):
-    """选择列表包含已完成任务时整批拒绝，不能静默跳过它并派出其他待办任务。"""
+def test_completed_task_in_plan_selection_is_reported_without_blocking_valid_task(runtime, backend):
+    """选择已完成任务时返回跳过原因，同次合并调用仍可分派其他合法待办任务。"""
 
     def script(state):
-        """完成首单后混选旧任务和新任务，纠正选择后才准备新单。"""
+        """完成首单后混选旧任务和新任务，由代码逐项筛选并准备新单。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("update_tasks", {"changes": [cancel_task("#1")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000001")]})
         yield tool("complete_plan", {"task_ids": task_ids(state)})
         yield reply()
         yield tool("complete_plan", {})
         yield reply()
-        yield tool("update_tasks", {"changes": [cancel_task("#4")]})
+        yield tool("update_tasks", {"changes": [cancel_task("#W0000004")]})
         yield tool("complete_plan", {"task_ids": task_ids(state)})
-        assert len(child.requests) == 3
-        assert [task.status for task in state.tasks.tasks.values()] == ["done", "pending"]
-        yield tool("complete_plan", {"task_ids": task_ids(state, status="pending")})
+        assert len(child.requests) == 6
+        assert [task.status for task in state.tasks.tasks.values()] == ["done", "pending_confirm"]
         yield reply()
 
-    coordinator, state, gateway, _, child = runtime(script, cancel_steps("#1") + cancel_steps("#4"))
-    turn(coordinator, state, "取消 #1")
+    coordinator, state, gateway, _, child = runtime(
+        script, cancel_steps("#W0000001") + cancel_steps("#W0000004")
+    )
+    turn(coordinator, state, "取消 #W0000001")
     turn(coordinator, state, "确认")
-    result = turn(coordinator, state, "还要取消 #4")
-    assert result["rounds"] == 4
+    result = turn(coordinator, state, "还要取消 #W0000004")
+    assert result["rounds"] == 3
     assert [task["status"] for task in result["tasks"]] == ["done", "pending_confirm"]
     assert len(child.requests) == 6
     assert sum(record["kind"] == "commit" for record in gateway.records) == 1
-    assert backend.export_snapshot()["orders"]["#4"]["status"] == "pending"
+    assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "pending"

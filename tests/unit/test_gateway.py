@@ -128,10 +128,15 @@ def test_database_path_identifies_business_store_without_allowing_rebind(
         ("get_order_details", {"order_id": 1}),
         ("find_user_id_by_email", {"email": "x@example.com", "user_id": "forged"}),
         ("list_all_product_types", {"user_id": "forged"}),
-        ("cancel_pending_order", {"order_id": "#1", "reason": "other"}),
+        ("cancel_pending_order", {"order_id": "#W0000001", "reason": "other"}),
         (
             "modify_pending_order_items",
-            {"order_id": "#1", "item_ids": ("1",), "new_item_ids": ["2"], "payment_method_id": "p"},
+            {
+                "order_id": "#W0000001",
+                "item_ids": ("1",),
+                "new_item_ids": ["2"],
+                "payment_method_id": "p",
+            },
         ),
     ],
 )
