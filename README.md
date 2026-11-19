@@ -82,7 +82,7 @@ uv run pytest -q tests/acceptance
 
 ## 单题模型评测
 
-先安装 `bench` 可选依赖。`config.toml` 的 `flash` 档位已配置官方 `https://api.deepseek.com`、API 模型名 `deepseek-flash` 和 `reasoning_effort = "high"`；该模型名对应 DeepSeek-V4.1-Flash-1017，见 [官方接入说明](https://api-docs.deepseek.com/zh-cn/)。密钥只写入同目录 `.env` 的 `TTWILL_API_KEY`。本体、模拟用户和判分共用此档位时：
+先安装 `bench` 可选依赖。`config.toml` 的 `flash` 档位已配置官方 `https://api.deepseek.com`、API 模型名 `deepseek-flash`，并用 `thinking = { type = "disabled" }` 关闭思考模式；该模型名对应 DeepSeek-V4.1-Flash-1017，见 [官方接入说明](https://api-docs.deepseek.com/zh-cn/)。密钥只写入同目录 `.env` 的 `TTWILL_API_KEY`。本体、模拟用户和判分共用此档位时：
 
 ```bash
 uv run --extra bench ttwill evaluate --task-id 6_zh_identity \
@@ -100,9 +100,11 @@ uv run --extra bench ttwill evaluate --task-id 6_zh_identity \
 
 2026-11-17 首次真实运行保存在 `runs/step7-deepseek-task6-20261117-attempt-001/`：`completed=true`、`termination_reason=user_stop`、`db_match=false`、`task_success=false`，判分为 0。53 次 API 调用均成功返回，输入 258260、输出 33126、其中缓存输入 169088 token，费用未知。协调者多次违反工具调用约定，随后触发轮数及上下文预算上限；没有提交写操作，最终用户退出。这是已完成判分的业务失败，保留原尝试，不重跑覆盖。
 
-本题没有自然语言断言，因此没有实际调用判分模型；该链路仍只有离线模拟验证。`action_checks` 也不能用于本体网关动作覆盖统计，原因见[接入记录](<docs/07 调研_tau2-bench.md#第-7-步接入记录>)。第 7 步已取得要求的真实单题判分，不代表任务表现通过；基线与正式实验尚未开始，困难评测集仍须在 D 组表现调优前冻结。
+本题没有自然语言断言，因此这次运行没有实际调用判分模型；后续 `60_zh_identity` 冒烟已运行自然语言判分，见 [F2 记录](<docs/09 失败案例与修复记录.md#f2开发快速集首次冒烟2026-11-18>)。`action_checks` 也不能用于本体网关动作覆盖统计，原因见[接入记录](<docs/07 调研_tau2-bench.md#第-7-步接入记录>)。第 7 步已取得要求的真实单题判分，不代表任务表现通过；20 题基线与正式实验尚未开始，困难评测集仍须在 D 组表现调优前冻结。
 
-协议修复已通过离线回归：身份验证前可直接询问信息，派工注明已验证身份，内部停止原因与客服回复分离，纯文本回复只归档一次；`complete_plan(task_ids=[...])` 可在同一次决策内结束计划并分派，仍先独立判定确认和核验。DeepSeek 思考工具协议要求的 `reasoning_content` 保留；上下文占用的后续测量见 [09 失败案例与修复记录](<docs/09 失败案例与修复记录.md>)。修复后未调用真实模型，实际改善留待开发快速集验证。
+首轮协议修复已通过离线回归：身份验证前可直接询问信息，派工注明已验证身份，内部停止原因与客服回复分离，纯文本回复只归档一次；`complete_plan(task_ids=[...])` 可在同一次决策内结束计划并分派，仍先独立判定确认和核验。2026-11-18 在 `60`、`88` 上的真实冒烟均完成判分但业务失败，尚未启动 20 题批次；详情及后续修复、复测见 [09 失败案例与修复记录](<docs/09 失败案例与修复记录.md>)。当前关闭思考的配置与该次 `high` 配置不同，结果不作同配置比较；服务返回的 `reasoning_content` 仍完整保存和回传。
+
+2026-11-19 已实现协调者只读查询、标识符入口规范及关闭思考；随后完成确认与分派解耦、相同任务更新不作废操作、模型状态精简和商品变更展示。全量 **810 项离线测试通过**。最新两题冒烟保存在 `runs/dev-quick-smoke-20261119-r2/`，判分均成功且无上下文超限；88 在明确确认后完成提交核验，达到 20 题运行门槛。60 存在确认模型把价格追问误判为同意的问题，成功分数不能替代授权审计；详情见 [09](<docs/09 失败案例与修复记录.md>)。前两次冒烟产物保留。
 
 ## 开发任务与批量评测
 
@@ -167,7 +169,7 @@ uv run ttwill coordinator-demo
 
 协调者先处理本轮改口和撤销，再独立判定上一回复的完整展示内容。只有仍有效、修订号和参数一致的操作能提交；多个展示项收到范围不明的“好的”时不提交。同单同类诉求聚合，同单不同写操作逐个办理，不同订单可并行。回复中的任务状态和操作详情由代码生成，模型的完成措辞不能覆盖业务事实。
 
-`[agent].max_rounds` 限制每条用户消息的协调决策次数，开发默认 8。身份查询、任务更新、结束计划、分派、回复以及无效决策均计一轮；每轮只调用一个协调工具，`dispatch_tasks` 可批量派出不同订单的任务，因此分派轮数也受该上限约束。超限将仍需推进的任务标为 `failed` 并说明原因；已准备且等待用户的操作保留。
+`[agent].max_rounds` 限制每条用户消息的协调决策次数，开发默认 8。身份查询、任务更新、结束计划、分派、回复以及无效决策均计一轮；一次响应可顺序执行多个只读工具，仍计一次决策，含协调工具时只接受一个调用。`dispatch_tasks` 可批量派出不同订单的任务，因此分派轮数也受该上限约束。超限将仍需推进的任务标为 `failed` 并说明原因；已准备且等待用户的操作保留。
 
 单独派发订单服务或售后任务：
 
@@ -209,7 +211,7 @@ runs/<run_id>/
 
 业务代码通过 `LLMClient.complete("flash", messages, tools=...)` 指定档位；实际模型与参数来自 `config.toml`。`FakeModel` 接受响应或错误序列，用于离线测试；`CompatibleModel` 支持非流式 Chat Completions 接口，保留工具调用和服务返回的扩展字段。
 
-切换真实服务时，在配置中填写实际 API `model`、`base_url` 与 `api_key_env`。密钥只写入同目录 `.env`，变量名与 `api_key_env` 一致（参见 `.env.example`）。参数写入 `[models.flash.parameters]`，不能覆盖调用层的模型、消息、工具和流式设置。当前固定官方默认思考强度 `high`，见 [思考模式说明](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)。使用统一调用层的示例：
+切换真实服务时，在配置中填写实际 API `model`、`base_url` 与 `api_key_env`。密钥只写入同目录 `.env`，变量名与 `api_key_env` 一致（参见 `.env.example`）。参数写入 `[models.flash.parameters]`，不能覆盖调用层的模型、消息、工具和流式设置。当前使用 `thinking = { type = "disabled" }` 关闭思考，不再设置 `reasoning_effort`；本体、模拟用户、判分及摘要均使用此 `flash` 档位。统一调用层直接发送 `thinking`，τ² 的 LiteLLM 适配通过 SDK 的 `extra_body` 传入，最终 HTTP 请求体一致，见 [思考模式说明](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode/)。使用统一调用层的示例：
 
 ```python
 from pathlib import Path
