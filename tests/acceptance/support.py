@@ -138,13 +138,13 @@ def prepare_steps(action: str, args: dict) -> list[dict]:
         tool("get_order_details", {"order_id": args["order_id"]}),
         tool("load_skill", {"name": skill}),
         tool(action, args),
-        tool("finish", {"missing": [], "message_hint": "请核对操作详情后确认。"}),
+        tool("finish", {"missing": [], "note": "请核对操作详情后确认。"}),
     ]
 
 
 def reply(show_task_ids: list[str] | None = None) -> dict:
     """请求按真实任务结果回复，可明确限制本次展示的任务范围。"""
-    return tool("reply", {"message_hint": "请查看办理结果。", "show_task_ids": show_task_ids})
+    return tool("reply", {"message": "请查看办理结果。", "show_task_ids": show_task_ids})
 
 
 class AcceptanceCase:
@@ -182,7 +182,7 @@ class AcceptanceCase:
         children: Iterable[dict],
         *,
         session_id: str = "chat1",
-        judge: Callable | Iterable[dict] = (),
+        judge: Callable | Iterable[dict] | None = None,
     ) -> AsyncIterator[PersistentRuntime]:
         """打开一段真实聊天，先验身份，退出时关闭所有连接。
 
@@ -191,6 +191,7 @@ class AcceptanceCase:
             children: 子 Agent 模型响应序列。
             session_id: 本场景中唯一的聊天标识，续办时必须换一个。
             judge: 独立确认模型响应序列，或接收 tasks 回调的生成器函数。
+                None 使用本组场景固定原话的预设判断，未登记输入使测试失败。
 
         Yields:
             已通过邮箱查找验证身份的 PersistentRuntime。
@@ -213,7 +214,41 @@ class AcceptanceCase:
 
         coordinator_script = iter(script(tasks))
         child_script = iter(children)
-        judge_script = iter(judge(tasks) if callable(judge) else judge)
+
+        def default_judgments():
+            """为验收场景的固定原话返回判定，并核对实际回复与候选卡片一致。"""
+            expected = {
+                ("好的", 2): "unrelated",
+                ("全部确认", 2): "confirm",
+                ("确认", 1): "confirm",
+            }
+            consumed = 0
+            while len(judge_fake.requests) > consumed:
+                data = json.loads(judge_fake.requests[consumed]["messages"][-1]["content"])
+                consumed += 1
+                key = data["user_message"], len(data["displayed"])
+                assert key in expected, f"未配置的确认场景：{key}"
+                assert all(
+                    shown["content"] in data["assistant_reply"] for shown in data["displayed"]
+                )
+                yield text(
+                    json.dumps(
+                        [
+                            {
+                                "operation_id": shown["operation_id"],
+                                "decision": expected[key],
+                                "reason": "场景预设的明确授权范围",
+                            }
+                            for shown in data["displayed"]
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+
+        judge_script = iter(
+            default_judgments() if judge is None else judge(tasks) if callable(judge) else judge
+        )
+        judge_fake = FakeModel(judge_script)
         gateway = ToolGateway(backend, trace, self.skills)
         llm = LLMClient(self.config, trace, FakeModel(coordinator_script))
         runner = SubAgentRunner(
@@ -227,7 +262,7 @@ class AcceptanceCase:
             runner,
             llm,
             max_rounds=self.config.agent.max_rounds,
-            judge=ConfirmationJudge(LLMClient(self.config, trace, FakeModel(judge_script))),
+            judge=ConfirmationJudge(LLMClient(self.config, trace, judge_fake)),
         )
         try:
             with Archive(self.run_dir / "archive.sqlite") as archive:

@@ -180,7 +180,7 @@ uv run ttwill agent-demo --capability order_service
 uv run ttwill agent-demo --capability after_sales
 ```
 
-每次演示创建独立业务库，用假模型依次查询订单、加载 Skill、准备取消或退货，再返回结构化结果；业务状态保持原样。输出包含 `result`、业务库和轨迹路径，状态应为 `need_confirm`。`actions`、业务事实和待确认参数由网关与后端记录填写；模型只提供 `missing`、`message_hint`，不能填写完成状态或调用提交工具。
+每次演示创建独立业务库，用假模型依次查询订单、加载 Skill、准备取消或退货，再返回结构化结果；业务状态保持原样。输出包含 `result`、业务库和轨迹路径，状态应为 `need_confirm`。`actions`、业务事实和待确认参数由网关与后端记录填写；模型只提供 `missing`、`note`，不能填写完成状态或调用提交工具。
 
 子 Agent 的循环由 `[agent].max_steps` 限制，开发默认 12 步。每个工具调用计一步，无工具回复也计一步；超限会返回 `failed`，作废本实例尚未提交的准备项，并记录 guard。实例结束即清除 Skill 加载记录，下一实例重新加载。政策正文保留固定来源中的英文，中文操作要点单独放在 `skills/`。
 

@@ -524,7 +524,7 @@ def offline_development_runtime(monkeypatch):
             [
                 tool_response("find_user_id_by_email", {"email": identity_email}),
                 tool_response("complete_plan", {}),
-                tool_response("reply", {"message_hint": "身份已验证，请说明需要办理的业务。"}),
+                tool_response("reply", {"message": "身份已验证，请说明需要办理的业务。"}),
             ]
         )
         control["agents"].append(fake)

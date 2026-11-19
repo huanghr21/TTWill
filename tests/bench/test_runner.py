@@ -151,8 +151,8 @@ def offline_runner(tmp_path, monkeypatch):
         )
         yield tool_response("dispatch_tasks", {"task_ids": [snapshot["tasks"][0]["id"]]})
         yield tool_response("get_order_details", {"order_id": "#W6729841"})
-        yield tool_response("finish", {"missing": [], "message_hint": "订单总额为 ¥5,806.01。"})
-        yield tool_response("reply", {"message_hint": "请查看订单金额。"})
+        yield tool_response("finish", {"missing": [], "note": "订单总额为 ¥5,806.01。"})
+        yield tool_response("reply", {"message": "请查看订单金额。"})
 
     fake = FakeModel(script())
     control["agent"] = fake

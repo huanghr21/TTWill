@@ -34,7 +34,7 @@ class Task:
         facts: 由实际业务查询形成的事实。
         actions: 由网关记录形成的操作历史，包括已作废请求。
         operation_ids: 当前修订关联的后端操作标识。
-        message_hint: 模型提供的回复要点，不作为执行证据。
+        note: 子 Agent 提供给协调者的备注，不作为执行证据。
         reason: 撤销或失败原因；正常待办时为 None。
         reason_internal: 原因是否只用于任务状态与轨迹，由代码设置并随检查点保存。
     """
@@ -51,7 +51,7 @@ class Task:
     facts: list[dict[str, Any]] = field(default_factory=list)
     actions: list[dict[str, Any]] = field(default_factory=list)
     operation_ids: list[str] = field(default_factory=list)
-    message_hint: str = ""
+    note: str = ""
     reason: str | None = None
     reason_internal: bool = False
 
@@ -360,7 +360,7 @@ class TaskStore:
                 return task.id, False
         task.revision += 1
         task.operation_ids = []
-        task.message_hint = ""
+        task.note = ""
         task.reason_internal = False
         if change.operation == "cancel":
             task.status = "cancelled"

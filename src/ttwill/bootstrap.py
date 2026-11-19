@@ -107,6 +107,40 @@ def _demo_tool_response(name: str, arguments: dict, call_id: str) -> dict:
     }
 
 
+def _demo_confirmation_response(operation_ids: list[str]) -> dict:
+    """为演示中明确的“确认”原话生成逐操作确认模型响应。
+
+    Args:
+        operation_ids: 演示上一回复已经展示的准备操作标识。
+
+    Returns:
+        固定演示使用的 Chat Completions 响应，不执行实际提交。
+    """
+    return {
+        "model": "fake-demo",
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        [
+                            {
+                                "operation_id": operation_id,
+                                "decision": "confirm",
+                                "reason": "演示用户明确确认上一回复展示的取消操作",
+                            }
+                            for operation_id in operation_ids
+                        ],
+                        ensure_ascii=False,
+                    ),
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 6},
+    }
+
+
 def _coordinator_demo_responses(
     state: ConversationState, email: str, order_id: str
 ) -> Iterator[dict]:
@@ -140,10 +174,13 @@ def _coordinator_demo_responses(
     yield _demo_tool_response("complete_plan", {}, "complete-plan-1")
     yield _demo_tool_response("dispatch_tasks", {"task_ids": list(state.tasks.tasks)}, "dispatch")
     yield _demo_tool_response(
-        "reply", {"message_hint": "已准备取消订单，请核对以下详情后确认。"}, "reply-1"
+        "reply", {"message": "已准备取消订单，请核对以下详情后确认。"}, "reply-1"
     )
     yield _demo_tool_response("complete_plan", {}, "complete-plan-2")
-    yield _demo_tool_response("reply", {"message_hint": "已核验本次办理结果。"}, "reply-2")
+    yield _demo_confirmation_response(
+        [operation_id for task in state.tasks.tasks.values() for operation_id in task.operation_ids]
+    )
+    yield _demo_tool_response("reply", {"message": "已核验本次办理结果。"}, "reply-2")
 
 
 async def run_coordinator_demo(config_path: Path) -> dict:
@@ -184,7 +221,7 @@ async def run_coordinator_demo(config_path: Path) -> dict:
             ("get_order_details", {"order_id": order_id}),
             ("load_skill", {"name": "cancel_pending_order"}),
             ("cancel_pending_order", {"order_id": order_id, "reason": "no longer needed"}),
-            ("finish", {"missing": [], "message_hint": "取消已准备，请用户核对并确认。"}),
+            ("finish", {"missing": [], "note": "取消已准备，请用户核对并确认。"}),
         ]
         child_llm = LLMClient(
             config,
@@ -254,7 +291,7 @@ async def run_agent_demo(config_path: Path, capability: str) -> dict:
         ("get_order_details", {"order_id": order["order_id"]}),
         ("load_skill", {"name": skills.required_skill(action)}),
         (action, arguments),
-        ("finish", {"missing": [], "message_hint": "已准备操作，请核对详情后确认。"}),
+        ("finish", {"missing": [], "note": "已准备操作，请核对详情后确认。"}),
     ]
     responses = [
         {
@@ -366,7 +403,7 @@ async def run_runtime_demo(config_path: Path) -> dict:
                         "cancel_pending_order",
                         {"order_id": order_id, "reason": "no longer needed"},
                     ),
-                    ("finish", {"missing": [], "message_hint": "请核对取消订单详情。"}),
+                    ("finish", {"missing": [], "note": "请核对取消订单详情。"}),
                 ]
                 if session_index == 0
                 else []
@@ -412,16 +449,23 @@ async def run_runtime_demo(config_path: Path) -> dict:
                         "runtime-dispatch",
                     )
                     yield _demo_tool_response(
-                        "reply", {"message_hint": "请核对取消详情。"}, "runtime-reply-1"
+                        "reply", {"message": "请核对取消详情。"}, "runtime-reply-1"
                     )
                 else:
                     yield _demo_tool_response("complete_plan", {}, "runtime-complete-2")
                     yield _demo_tool_response(
-                        "reply", {"message_hint": "续办需要重新核对以下详情。"}, "runtime-reply-2"
+                        "reply", {"message": "续办需要重新核对以下详情。"}, "runtime-reply-2"
                     )
                     yield _demo_tool_response("complete_plan", {}, "runtime-complete-3")
+                    yield _demo_confirmation_response(
+                        [
+                            operation_id
+                            for task in runtime.state.tasks.tasks.values()
+                            for operation_id in task.operation_ids
+                        ]
+                    )
                     yield _demo_tool_response(
-                        "reply", {"message_hint": "已核验取消结果。"}, "runtime-reply-3"
+                        "reply", {"message": "已核验取消结果。"}, "runtime-reply-3"
                     )
 
             coordinator_llm = LLMClient(config, trace, FakeModel(responses()))

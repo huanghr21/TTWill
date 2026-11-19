@@ -57,7 +57,7 @@ def prepared_runtime(
             id=REPLAY_CHANGE["task_id"],
             revision=2,
             status="pending_confirm",
-            message_hint="已准备取消，请确认。",
+            note="已准备取消，请确认。",
             reason="等待用户确认",
             **{
                 key: deepcopy(value)
@@ -140,7 +140,7 @@ def test_real_request_changes_still_invalidate_old_prepare(prepared_runtime, upd
         {"task_id": task.id, "status": current.status, "reason": None, "changed": True}
     ]
     assert current.revision == task.revision + 1 and current.operation_ids == []
-    assert current.message_hint == "" and current.facts == task.facts
+    assert current.note == "" and current.facts == task.facts
     assert current.actions[:-1] == task.actions
     assert gateway.get_operation(context, operation["operation_id"])["status"] == "rejected"
 

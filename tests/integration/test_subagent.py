@@ -59,7 +59,7 @@ def finish(*, missing: list[str] | None = None, hint: str = "请核对操作详�
     Returns:
         只调用 finish 的完整模型响应。
     """
-    return response(("finish", {"missing": missing or [], "message_hint": hint}))
+    return response(("finish", {"missing": missing or [], "note": hint}))
 
 
 def cancel_steps(order_id: str = "#W0000001") -> list[dict]:
@@ -227,7 +227,7 @@ def test_forged_result_fields_are_rejected_then_model_can_correct(runtime, forge
     """模型伪造可信字段会触发格式护栏，修正后也不产生虚假动作。"""
     runner, fake, gateway = runtime(
         [
-            response(("finish", {"missing": [], "message_hint": "已完成", forged: "伪造"})),
+            response(("finish", {"missing": [], "note": "已完成", forged: "伪造"})),
             finish(missing=["订单号"]),
         ]
     )
@@ -243,7 +243,7 @@ def test_forged_result_fields_are_rejected_then_model_can_correct(runtime, forge
 def test_finish_does_not_coerce_invalid_fields(runtime, missing):
     """结束字段不进行字符串、列表或空值的隐式类型转换。"""
     runner, _, _ = runtime(
-        [response(content={"missing": missing, "message_hint": "缺少资料"})], max_steps=1
+        [response(content={"missing": missing, "note": "缺少资料"})], max_steps=1
     )
     result = run_task(runner)
     assert result["status"] == "failed"
@@ -256,7 +256,7 @@ def test_plain_json_finish_and_read_result_are_supported(runtime):
     runner, _, _ = runtime(
         [
             response(("get_order_details", {"order_id": "#W0000001"})),
-            response(content={"missing": [], "message_hint": "订单待发货。"}),
+            response(content={"missing": [], "note": "订单待发货。"}),
         ]
     )
     result = run_task(runner, task=DispatchTask("read", "查询订单"))
@@ -361,7 +361,7 @@ def test_finish_at_exact_budget_succeeds_and_same_batch_finish_is_rejected(runti
     runner, fake, _ = runtime(
         [
             response(
-                ("finish", {"missing": [], "message_hint": "结束"}),
+                ("finish", {"missing": [], "note": "结束"}),
                 ("get_order_details", {"order_id": "#W0000001"}),
             ),
             finish(hint="订单待发货"),

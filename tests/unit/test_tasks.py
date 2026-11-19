@@ -90,7 +90,7 @@ def prepare(gateway: ToolGateway, context: CallContext, task: Task) -> dict:
         ("facts", [{"result": "forged"}]),
         ("actions", [{"status": "committed"}]),
         ("operation_ids", ["forged"]),
-        ("message_hint", "假装已经完成"),
+        ("note", "假装已经完成"),
         ("user_id", "u2"),
     ],
 )
@@ -218,7 +218,7 @@ def test_update_invalidates_prepared_operation_and_preserves_history(runtime: tu
     store.apply([request(missing=["旧缺口"])], gateway, context)
     task = next(iter(store.tasks.values()))
     task.facts.append({"tool": "get_order_details", "result": {"status": "pending"}})
-    task.message_hint = "旧提示"
+    task.note = "旧提示"
     operation = prepare(gateway, context, task)
     store.apply(
         [request(operation="update", task_id=task.id, instruction="换一个取消原因")],
@@ -227,7 +227,7 @@ def test_update_invalidates_prepared_operation_and_preserves_history(runtime: tu
     )
     updated = store.tasks[task.id]
     assert updated.revision == 2 and updated.status == "pending"
-    assert updated.operation_ids == [] and updated.missing == [] and updated.message_hint == ""
+    assert updated.operation_ids == [] and updated.missing == [] and updated.note == ""
     assert updated.facts == task.facts
     assert updated.actions[0] == task.actions[0]
     assert updated.actions[-1]["status"] == "rejected"

@@ -1,6 +1,7 @@
 """验证商品修改确认只展示真实改动，保留完整业务预览与收付款金额。"""
 
 import json
+import re
 from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
@@ -45,16 +46,16 @@ def retail_60_gateway(tmp_path: Path, skill_catalog: SkillCatalog) -> Iterator[T
         backend.close()
 
 
-def shown_preview(content: str) -> dict:
-    """解析用户确认正文中的预期结果。
+def shown_preview(content: str) -> str:
+    """取得用户确认正文中的预期结果文本。
 
     Args:
         content: 展示层生成的完整中文确认正文。
 
     Returns:
-        中文字段构成的预期结果字典。
+        包含中文字段和缩进列表的预期结果正文。
     """
-    return json.loads(content.split("\n\n确认后预期结果：\n", 1)[1])
+    return content.split("\n\n确认后预期结果：\n", 1)[1]
 
 
 def prepare_earbuds(gateway: ToolGateway) -> dict:
@@ -93,22 +94,36 @@ def test_retail_60_shows_only_earbuds_and_preserves_full_authoritative_preview(
     content = gateway.operation_content(context, operation)
 
     preview = shown_preview(content)
-    assert set(preview) == {"订单状态", "本次商品变更", "支付与退款明细"}
-    changes = preview["本次商品变更"]
-    assert len(changes) == 1
-    assert changes[0]["原商品"]["商品名称"] == "无线耳机"
-    assert changes[0]["原商品"]["商品规格编号"] == "3694871183"
-    assert changes[0]["原商品"]["价格"] == 1796.69
-    assert changes[0]["原商品"]["规格"]["color"] == "白色"
-    assert changes[0]["新规格"]["商品规格编号"] == "6077640618"
-    assert changes[0]["新规格"]["价格"] == 1700.44
-    assert changes[0]["新规格"]["规格"] == {
-        "color": "蓝色",
-        "battery life": "8小时",
-        "water resistance": "不防水",
-    }
-    assert [item["金额"] for item in preview["支付与退款明细"]] == [9236.01, 96.25]
-    assert [item["类型"] for item in preview["支付与退款明细"]] == ["付款", "退款"]
+    assert [line for line in preview.splitlines() if line.startswith("· ")] == [
+        "· 订单状态：待发货（商品修改后）",
+        "· 本次商品变更：",
+        "· 支付与退款明细：",
+    ]
+    assert preview.count("· 原商品：") == preview.count("· 新规格：") == 1
+    original, replacement = preview.split("    · 原商品：\n", 1)[1].split("    · 新规格：\n", 1)
+    assert "      · 商品名称：无线耳机" in original
+    assert "      · 商品规格编号：3694871183" in original
+    assert "      · 价格：1796.69" in original
+    assert "        · color：白色" in original
+    assert "      · 商品规格编号：6077640618" in replacement
+    assert "      · 价格：1700.44" in replacement
+    assert (
+        "      · 规格：\n"
+        "        · color：蓝色\n"
+        "        · battery life：8小时\n"
+        "        · water resistance：不防水"
+    ) in replacement
+    assert preview.endswith(
+        "· 支付与退款明细：\n"
+        "  · 第 1 项：\n"
+        "    · 类型：付款\n"
+        "    · 金额：9236.01\n"
+        "    · 支付方式：paypal_3742148\n"
+        "  · 第 2 项：\n"
+        "    · 类型：退款\n"
+        "    · 金额：96.25\n"
+        "    · 支付方式：paypal_3742148"
+    )
     assert all(
         value not in content
         for value in (
@@ -153,9 +168,14 @@ def test_duplicate_items_keep_original_purchase_prices_and_pair_by_order_positio
             },
             request_key("duplicate-items", 1, action),
         )
-        changes = shown_preview(gateway.operation_content(context, operation))["本次商品变更"]
-        assert [change["原商品"]["价格"] for change in changes] == [19.0, 20.0]
-        assert [change["新规格"]["价格"] for change in changes] == [30.0, 30.0]
+        preview = shown_preview(gateway.operation_content(context, operation))
+        prices = re.findall(
+            r"· 原商品：.*?· 价格：(\S+).*?· 新规格：.*?· 价格：(\S+)",
+            preview,
+            re.DOTALL,
+        )
+        assert prices == [("19.0", "30.0"), ("20.0", "30.0")]
+        assert "17.0" not in preview
         assert len(operation["preview"]["items"]) == 3
     finally:
         backend.close()
@@ -183,8 +203,12 @@ def test_cancel_preview_preserves_existing_scope(retail_60_gateway: ToolGateway)
     content = gateway.operation_content(context, operation)
     assert content == operation_content(operation)
     preview = shown_preview(content)
-    assert set(preview) == {"订单状态", "取消原因", "支付与退款明细"}
-    assert [item["金额"] for item in preview["支付与退款明细"]] == [9236.01, 9236.01]
+    assert [line for line in preview.splitlines() if line.startswith("· ")] == [
+        "· 订单状态：取消",
+        "· 取消原因：不再需要（no longer needed）",
+        "· 支付与退款明细：",
+    ]
+    assert re.findall(r"· 金额：(\S+)", preview) == ["9236.01", "9236.01"]
 
 
 @pytest.mark.parametrize("user_id", [None, "other-user"])

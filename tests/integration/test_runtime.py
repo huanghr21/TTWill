@@ -83,12 +83,13 @@ def task_ids(request: dict) -> list[str]:
     raise AssertionError("协调模型输入缺少权威任务快照")
 
 
-def prepare_script(ids, *, combined=False):
+def prepare_script(ids, *, combined=False, message="请确认"):
     """先创建稳定任务，再结束计划、准备操作并向用户展示。
 
     Args:
         ids: 从当前模型输入读取任务标识的函数。
         combined: 是否在 complete_plan 同一次决策中分派已有任务。
+        message: 展示操作卡片时发给用户的完整正文。
 
     Yields:
         按执行顺序排列的协调工具响应，任务创建始终单独占用一次决策。
@@ -112,13 +113,13 @@ def prepare_script(ids, *, combined=False):
     else:
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": ids()})
-    yield tool("reply", {"message_hint": "请确认"})
+    yield tool("reply", {"message": message})
 
 
 def followup_script(ids):
     """仅结束当前计划并请求按实际状态回复，不提出业务提交。"""
     yield tool("complete_plan", {})
-    yield tool("reply", {"message_hint": "继续办理"})
+    yield tool("reply", {"message": "继续办理"})
 
 
 def child_script() -> list[dict]:
@@ -126,7 +127,7 @@ def child_script() -> list[dict]:
     return [
         tool("load_skill", {"name": "cancel_pending_order"}),
         tool("cancel_pending_order", {"order_id": "#W0000001", "reason": "no longer needed"}),
-        tool("finish", {"missing": [], "message_hint": "等待确认"}),
+        tool("finish", {"missing": [], "note": "等待确认"}),
     ]
 
 
@@ -141,6 +142,44 @@ def text_response(content: str) -> dict:
             }
         ],
     }
+
+
+def confirmation_model(decisions: dict[str, str]) -> FakeModel:
+    """构造只接受明确登记用户原话的独立确认假模型。
+
+    Args:
+        decisions: 测试允许的用户原话与逐项确认结论，不做模糊匹配或默认授权。
+
+    Returns:
+        按本次请求的候选操作返回已登记结论的假模型，保留完整请求供测试核对。
+
+    Raises:
+        AssertionError: 请求缺少完整上一回复，或用户原话不在测试登记表中。
+    """
+
+    def responses():
+        """仅消费测试登记的判定输入，未登记输入直接令测试失败。"""
+        while True:
+            payload = json.loads(fake.requests[-1]["messages"][-1]["content"])
+            assert isinstance(payload.get("assistant_reply"), str)
+            assert payload["assistant_reply"]
+            assert payload["user_message"] in decisions, payload["user_message"]
+            yield text_response(
+                json.dumps(
+                    [
+                        {
+                            "operation_id": item["operation_id"],
+                            "decision": decisions[payload["user_message"]],
+                            "reason": "本项测试为该用户原话明确登记的判定",
+                        }
+                        for item in payload["displayed"]
+                    ],
+                    ensure_ascii=False,
+                )
+            )
+
+    fake = FakeModel(responses())
+    return fake
 
 
 @pytest.fixture
@@ -158,7 +197,15 @@ def runtime_factory(tmp_path, backend, skill_catalog):
     """
 
     @asynccontextmanager
-    async def make(session_id, script, children=(), *, business=None, thread_id="thread"):
+    async def make(
+        session_id,
+        script,
+        children=(),
+        *,
+        business=None,
+        thread_id="thread",
+        confirmation_decisions=None,
+    ):
         """打开一段新聊天，复用同一业务任务已有的运行文件。
 
         Args:
@@ -167,6 +214,8 @@ def runtime_factory(tmp_path, backend, skill_catalog):
             children: 本段聊天允许的子 Agent 响应；默认不允许新业务调用。
             business: 指定后端连接；None 使用测试的原业务库。
             thread_id: 同一评测任务跨聊天使用的检查点线程标识。
+            confirmation_decisions: 独立确认模型可接受的原话与结论；省略时只
+                登记“确认”为 confirm，其他输入必须由用例明确提供。
 
         Yields:
             runtime、coordinator、gateway、协调假模型、子 Agent 假模型和档案。
@@ -194,6 +243,10 @@ def runtime_factory(tmp_path, backend, skill_catalog):
             max_steps=8,
         )
         coordinator = Coordinator(gateway, runner, llm, max_rounds=12)
+        judge_fake = confirmation_model(
+            {"确认": "confirm"} if confirmation_decisions is None else confirmation_decisions
+        )
+        coordinator.judge.llm = LLMClient(config, trace, judge_fake)
         with Archive(tmp_path / "archive.sqlite") as archive:
             compiler = ContextCompiler(archive, llm, max_chars=200_000, recent_turns=2)
             async with AsyncSqliteSaver.from_conn_string(
@@ -256,7 +309,7 @@ def test_internal_stop_reason_survives_checkpoint_without_leaking(
             assert opened["tasks"][0]["reason_internal"] is True
             result = await runtime.send_message("请告诉我处理情况")
             assert result["tasks"][0]["reason"] == task["reason"]
-            assert STOP_NOTICE in result["reply"] and task["reason"] not in result["reply"]
+            assert result["reply"] == "继续办理" and task["reason"] not in result["reply"]
             assert result["displayed"] == [] and result["confirmation_results"] == []
 
     asyncio.run(scenario())
@@ -277,7 +330,7 @@ def test_natural_plain_text_reply_keeps_reasoning_and_is_archived_once(runtime_f
         yield tool("complete_plan", {})
         yield verified_reply
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "可以，请告诉我订单编号。"})
+        yield tool("reply", {"message": "可以，请告诉我订单编号。"})
 
     async def scenario():
         """检查认证前请求、认证后档案以及后续模型输入均不重复或丢失回复。"""
@@ -335,7 +388,7 @@ def test_same_session_waits_and_commits_only_after_next_message(runtime_factory,
     async def scenario():
         """运行两轮并验证待确认状态真正进入 LangGraph 中断。"""
         async with runtime_factory("chat1", script, child_script()) as bundle:
-            runtime, _, gateway, _, _, _ = bundle
+            runtime, coordinator, gateway, _, _, archive = bundle
             await open_u1(runtime)
             first = await runtime.send_message("请取消订单 #W0000001")
             assert first["tasks"][0]["status"] == "pending_confirm"
@@ -343,12 +396,84 @@ def test_same_session_waits_and_commits_only_after_next_message(runtime_factory,
             saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
             assert saved.next
             assert any(task.interrupts for task in saved.tasks)
+            assert saved.values["conversation"]["last_reply"] == first["reply"]
+            assert (await runtime.snapshot()).last_reply == first["reply"]
             second = await runtime.send_message("确认")
             assert second["tasks"][0]["status"] == "done"
             assert second["displayed"] == []
             assert len(second["confirmation_results"]) == 1
             assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
             assert sum(record.get("kind") == "commit" for record in gateway.records) == 1
+            judgment = json.loads(
+                coordinator.judge.llm.backend.requests[0]["messages"][-1]["content"]
+            )
+            assert judgment["assistant_reply"] == first["reply"]
+            assert judgment["displayed"] == [
+                {"operation_id": item["operation_id"], "content": item["content"]}
+                for item in first["displayed"]
+            ]
+            assert (await runtime.snapshot()).last_reply == second["reply"]
+            replies = [
+                entry["payload"]["content"]
+                for entry in archive.messages("thread", "u1")
+                if entry["payload"]["role"] == "assistant"
+                and not entry["payload"].get("tool_calls")
+            ]
+            assert replies == [first["reply"], second["reply"]]
+
+    asyncio.run(scenario())
+
+
+def test_full_reply_survives_checkpoint_for_confirmation_disambiguation(runtime_factory, backend):
+    """正文提问与操作卡片一起保存，用户回答正文不能只凭卡片被解释为授权。"""
+    explanation = "取消申请已准备好。您希望我先解释退款方式吗？"
+
+    def script(ids):
+        """先在卡片前询问解释需求，再正常回复该问题。"""
+        yield from prepare_script(ids, message=explanation)
+        yield tool("complete_plan", {})
+        yield tool("reply", {"message": "退款会退回原支付方式；请核对下面的取消操作。"})
+
+    async def scenario():
+        """检查真实检查点、独立模型输入和档案都保留正文，业务仍未提交。"""
+        async with runtime_factory(
+            "reply_context", script, child_script(), confirmation_decisions={"好的": "unrelated"}
+        ) as bundle:
+            runtime, coordinator, gateway, _, _, archive = bundle
+            await open_u1(runtime)
+            first = await runtime.send_message("请取消订单 #W0000001")
+            assert first["reply"].startswith(explanation + "\n\n")
+            assert explanation not in first["displayed"][0]["content"]
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert saved.values["conversation"]["last_reply"] == first["reply"]
+
+            second = await runtime.send_message("好的")
+
+            assert second["confirmation_results"][0]["decision"] == "unrelated"
+            assert second["tasks"][0]["status"] == "pending_confirm"
+            assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
+            assert not any(record.get("kind") == "commit" for record in gateway.records)
+            requests = coordinator.judge.llm.backend.requests
+            assert len(requests) == 1
+            payload = json.loads(requests[0]["messages"][-1]["content"])
+            assert payload["assistant_reply"] == first["reply"]
+            assert payload["user_message"] == "好的"
+            assert payload["displayed"] == [
+                {
+                    "operation_id": first["displayed"][0]["operation_id"],
+                    "content": first["displayed"][0]["content"],
+                }
+            ]
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert saved.values["work"]["previous_reply"] == first["reply"]
+            assert saved.values["conversation"]["last_reply"] == second["reply"]
+            actual_replies = [
+                entry["payload"]["content"]
+                for entry in archive.messages("thread", "u1")
+                if entry["payload"]["role"] == "assistant"
+                and not entry["payload"].get("tool_calls")
+            ]
+            assert actual_replies == [first["reply"], second["reply"]]
 
     asyncio.run(scenario())
 
@@ -443,15 +568,26 @@ def test_reopened_session_reauthenticates_and_redisplays_before_confirmation(
             first = await runtime.send_message("请取消订单 #W0000001")
             operation_id = first["displayed"][0]["operation_id"]
             task_id = first["tasks"][0]["id"]
+            old_reply = first["reply"]
+            assert (await runtime.snapshot()).last_reply == old_reply
         async with runtime_factory("chat2", script) as bundle:
-            runtime, _, gateway, _, child_fake, _ = bundle
+            runtime, coordinator, gateway, _, child_fake, archive = bundle
             await open_u1(runtime)
             state = await runtime.snapshot()
             assert state.last_display == []
+            assert state.last_reply == ""
             assert state.session.session_id == "chat2"
             assert state.tasks.tasks[task_id].operation_ids == [operation_id]
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert saved.values["conversation"]["last_reply"] == ""
+            assert saved.values["work"] is None
+            assert any(
+                entry["payload"].get("content") == old_reply
+                for entry in archive.messages("thread", "u1")
+            )
             first = await runtime.send_message("确认")
             assert first["confirmation_results"] == []
+            assert coordinator.judge.llm.backend.requests == []
             assert first["tasks"][0]["status"] == "pending_confirm"
             assert first["displayed"][0]["operation_id"] == operation_id
             assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
@@ -459,6 +595,11 @@ def test_reopened_session_reauthenticates_and_redisplays_before_confirmation(
             assert second["tasks"][0]["status"] == "done"
             assert child_fake.requests == []
             assert gateway.records[0]["action"] == "find_user_id_by_email"
+            judgment = json.loads(
+                coordinator.judge.llm.backend.requests[0]["messages"][-1]["content"]
+            )
+            assert judgment["assistant_reply"] == first["reply"]
+            assert judgment["assistant_reply"] != old_reply
 
     asyncio.run(scenario())
 
@@ -568,7 +709,7 @@ def test_combined_confirmation_and_prepare_recover_before_node_checkpoint(
             },
         )
         yield tool("complete_plan", {"task_ids": ids()[:1]})
-        yield tool("reply", {"message_hint": "请先确认修改地址"})
+        yield tool("reply", {"message": "请先确认修改地址"})
         yield tool("complete_plan", {"task_ids": ids()[1:]})
 
     def resumed_script(ids):
@@ -579,7 +720,7 @@ def test_combined_confirmation_and_prepare_recover_before_node_checkpoint(
     children = [
         tool("load_skill", {"name": "modify_pending_order_address"}),
         tool("modify_pending_order_address", {"order_id": "#W0000001", **address}),
-        tool("finish", {"missing": [], "message_hint": "等待确认新地址"}),
+        tool("finish", {"missing": [], "note": "等待确认新地址"}),
         *child_script(),
     ]
 
@@ -735,7 +876,7 @@ def test_restart_drops_confirmation_from_interrupted_previous_turn(
         yield from prepare_script(ids)
         yield from followup_script(ids)
 
-    async def crash_before_confirmation(state, context, user_message, previous):
+    async def crash_before_confirmation(state, context, user_message, previous, previous_reply):
         """保留已存的真实用户同意，但模拟独立判定和提交之前进程退出。
 
         Args:
@@ -743,12 +884,15 @@ def test_restart_drops_confirmation_from_interrupted_previous_turn(
             context: 本次确认使用的已验证身份。
             user_message: 本轮真实用户同意，已在 begin 节点后持久化。
             previous: 上一条回复的展示快照，此时尚未失效。
+            previous_reply: 上一条实际发送的正文和卡片，已随本轮进度保存。
 
         Raises:
             OSError: 独立判定之前模拟进程退出，保留旧轮次进度。
         """
         assert user_message == "确认"
         assert len(previous) == 1
+        assert previous_reply.startswith("请确认\n\n")
+        assert previous[0]["content"] in previous_reply
         raise OSError("模拟确认轮次中断")
 
     async def scenario():
@@ -761,9 +905,15 @@ def test_restart_drops_confirmation_from_interrupted_previous_turn(
             monkeypatch.setattr(coordinator, "_confirm", crash_before_confirmation)
             with pytest.raises(OSError, match="确认轮次中断"):
                 await runtime.send_message("确认")
+            saved = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert saved.values["work"]["previous_reply"] == first["reply"]
+            assert saved.values["conversation"]["last_reply"] == ""
         async with runtime_factory("chat2", followup_script) as bundle:
             runtime, _, gateway, _, _, _ = bundle
             await open_u1(runtime)
+            restored = await runtime.graph.aget_state({"configurable": {"thread_id": "thread"}})
+            assert restored.values["work"] is None
+            assert restored.values["conversation"]["last_reply"] == ""
             result = await runtime.send_message("继续办理")
             assert result["tasks"][0]["status"] == "pending_confirm"
             assert result["displayed"][0]["operation_id"] == operation_id
@@ -842,23 +992,31 @@ def test_long_history_summary_is_reused_without_authorizing_writes(runtime_facto
             runtime.compiler.llm = LLMClient(coordinator.llm.config, gateway.trace, summary_fake)
 
             def judgments():
-                """只根据独立请求中的真实用户问题给出未确认结论。"""
-                payload = json.loads(judge_fake.requests[-1]["messages"][-1]["content"])
-                assert payload["user_message"] == "现在进展如何？"
-                assert malicious_summary not in json.dumps(judge_fake.requests, ensure_ascii=False)
-                yield text_response(
-                    json.dumps(
-                        [
-                            {
-                                "operation_id": item["operation_id"],
-                                "decision": "unrelated",
-                                "reason": "当前用户仅询问进展，没有确认办理",
-                            }
-                            for item in payload["displayed"]
-                        ],
-                        ensure_ascii=False,
+                """逐轮核对完整上一回复，只为真实进展问题和随后确认提供固定结论。"""
+                for message, decision in (("现在进展如何？", "unrelated"), ("确认", "confirm")):
+                    payload = json.loads(judge_fake.requests[-1]["messages"][-1]["content"])
+                    assert payload["user_message"] == message
+                    previous = prepared if decision == "unrelated" else progress
+                    assert payload["assistant_reply"] == previous["reply"]
+                    assert malicious_summary not in json.dumps(
+                        judge_fake.requests, ensure_ascii=False
                     )
-                )
+                    yield text_response(
+                        json.dumps(
+                            [
+                                {
+                                    "operation_id": item["operation_id"],
+                                    "decision": decision,
+                                    "reason": "当前用户询问进展"
+                                    if decision == "unrelated"
+                                    else "当前用户明确确认",
+                                }
+                                for item in payload["displayed"]
+                            ],
+                            ensure_ascii=False,
+                        )
+                    )
+                raise AssertionError("长历史用例出现未登记的确认请求")
 
             judge_fake = FakeModel(judgments())
             coordinator.judge.llm = LLMClient(coordinator.llm.config, gateway.trace, judge_fake)
@@ -873,7 +1031,7 @@ def test_long_history_summary_is_reused_without_authorizing_writes(runtime_facto
             done = await runtime.send_message("确认")
             assert done["tasks"][0]["status"] == "done"
             assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
-            assert len(judge_fake.requests) == 1
+            assert len(judge_fake.requests) == 2
             assert len(summary_fake.requests) == 1
             summaries = archive.entries("thread", "u1", kind="summary")
             assert len(summaries) == 1
@@ -985,7 +1143,7 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
         )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": ids()})
-        yield tool("reply", {"message_hint": "展示实际查询结果"})
+        yield tool("reply", {"message": "展示实际查询结果"})
 
     async def scenario():
         """先制造归档已成功但 begin 未保存的窗口，再重建全部运行时连接。"""
@@ -1032,7 +1190,7 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
             assert interrupted_turn == 1
         children = [
             tool("get_order_details", {"order_id": "#W0000001"}),
-            tool("finish", {"missing": [], "message_hint": "查询完成"}),
+            tool("finish", {"missing": [], "note": "查询完成"}),
         ]
         async with runtime_factory("chat2", query_script, children) as bundle:
             runtime, _, _, _, _, archive = bundle
@@ -1070,7 +1228,7 @@ def test_natural_intake_waits_for_identity_before_reading_history(runtime_factor
     def script(ids):
         """先索取身份，再从用户实际提供的邮箱进入取消流程。"""
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "请提供邮箱"})
+        yield tool("reply", {"message": "请提供邮箱"})
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield from prepare_script(ids)
 
@@ -1209,7 +1367,7 @@ def test_natural_intake_owner_mismatch_cannot_bypass_next_identity(runtime_facto
         """先查询另一个用户，再只请求身份信息。"""
         yield tool("find_user_id_by_email", {"email": "u2@example.com"})
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "请重新提供邮箱"})
+        yield tool("reply", {"message": "请重新提供邮箱"})
 
     async def scenario():
         """构造真实旧任务，确保错误身份被拒绝后不会保留临时认证。"""
@@ -1236,7 +1394,7 @@ def test_natural_intake_identity_must_precede_task_creation(runtime_factory):
         """尝试越过身份更新任务，再正常向用户索取身份。"""
         yield next(prepare_script(ids))
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "请提供邮箱"})
+        yield tool("reply", {"message": "请提供邮箱"})
 
     async def scenario():
         """通过真实协调工具校验阻止任务创建，并确认仍无图状态。"""
@@ -1293,7 +1451,7 @@ def test_natural_intake_failed_identity_io_cannot_leave_verified_memory(
         """先查询身份，失败后只重新索取身份，不创建任务。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "请重新提供邮箱"})
+        yield tool("reply", {"message": "请重新提供邮箱"})
 
     async def scenario():
         """在网关已经绑定身份的窗口中断，验证内存认证立即清除。"""
@@ -1331,7 +1489,7 @@ def test_natural_intake_can_retry_after_first_checkpoint_write_failure(
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield tool("complete_plan", {})
-        yield tool("reply", {"message_hint": "请说明需要办理的业务"})
+        yield tool("reply", {"message": "请说明需要办理的业务"})
 
     async def scenario():
         """保留两次认证原话与独立打开事件，并核对局部轮次到持久轮次的映射。"""

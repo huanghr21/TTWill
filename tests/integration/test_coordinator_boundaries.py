@@ -57,7 +57,7 @@ def test_88_identity_then_question_does_not_require_empty_plan(runtime):
     def script(state):
         """使用真实失败输出的 reply 结构，仅将账户改为独立测试数据。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
-        yield tool("reply", {"message_hint": question})
+        yield tool("reply", {"message": question})
 
     coordinator, state, gateway, fake, child = runtime(script, [])
     result = turn(coordinator, state, "我要把书架改成 4 英尺，邮箱 u1@example.com")
@@ -81,7 +81,7 @@ def test_88_two_order_reads_share_one_decision_and_keep_message_pairs(runtime, b
         """直接查询两单并解释，不创建只读派工任务。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield reads
-        yield tool("reply", {"message_hint": "已查到两单，第一单待发货，第二单已送达。"})
+        yield tool("reply", {"message": "已查到两单，第一单待发货，第二单已送达。"})
 
     coordinator, state, gateway, fake, child = runtime(script, [], max_rounds=3)
     result = turn(coordinator, state, "查一下我的两张订单")
@@ -108,7 +108,7 @@ def test_88_two_order_reads_share_one_decision_and_keep_message_pairs(runtime, b
 def test_read_mixed_with_coordination_rejects_entire_response(runtime, coordination):
     """只读和协调工具混在一次响应时整批拒绝，首个只读调用也不执行。"""
     arguments = {
-        "reply": {"message_hint": "请确认"},
+        "reply": {"message": "请确认"},
         "update_tasks": {"changes": [cancel_task("#W0000001")]},
         "complete_plan": {},
         "dispatch_tasks": {"task_ids": ["guessed"]},
@@ -122,7 +122,7 @@ def test_read_mixed_with_coordination_rejects_entire_response(runtime, coordinat
         """发出不合法的混合调用，再用合法回复结束。"""
         yield tool("find_user_id_by_email", {"email": "u1@example.com"})
         yield mixed
-        yield tool("reply", {"message_hint": "请说明具体需求。"})
+        yield tool("reply", {"message": "请说明具体需求。"})
 
     coordinator, state, gateway, fake, child = runtime(script, [])
     result = turn(coordinator, state, "你好")
@@ -142,7 +142,7 @@ def test_identity_batch_cannot_unlock_business_reads_inside_same_response(runtim
     def script(state):
         """混合身份查找与业务查询，之后正常结束对话。"""
         yield reads
-        yield tool("reply", {"message_hint": "已验证身份。"})
+        yield tool("reply", {"message": "已验证身份。"})
 
     coordinator, state, gateway, fake, _ = runtime(script, [])
     result = turn(coordinator, state, "u1@example.com")
@@ -167,7 +167,7 @@ def test_multiple_identity_lookups_cannot_switch_user(runtime):
             tool("find_user_id_by_email", {"email": "u2@example.com"}),
         )
         yield tool("get_user_details", {"user_id": "u1"})
-        yield tool("reply", {"message_hint": "已读取当前账户。"})
+        yield tool("reply", {"message": "已读取当前账户。"})
 
     coordinator, state, gateway, fake, _ = runtime(script, [])
     result = turn(coordinator, state, "查询账户")
@@ -188,7 +188,7 @@ def test_read_batch_error_keeps_remaining_results_paired(runtime):
             tool("get_order_details", {"order_id": "#W0000003"}),
             tool("get_order_details", {"order_id": "#W0000001"}),
         )
-        yield tool("reply", {"message_hint": "已找到当前用户的订单。"})
+        yield tool("reply", {"message": "已找到当前用户的订单。"})
 
     coordinator, state, gateway, fake, _ = runtime(script, [])
     result = turn(coordinator, state, "查询订单")
@@ -300,13 +300,13 @@ def test_60_order_format_matches_read_facts_through_checkpoints(runtime_factory)
             {"changes": [add_task("get_order_details", " w0000001 ", "查询订单明细")]},
         )
         yield tool("dispatch_tasks", {"task_ids": ids()})
-        yield tool("reply", {"message_hint": "已查到订单。"})
+        yield tool("reply", {"message": "已查到订单。"})
 
     async def scenario():
         """使用真实 SQLite 检查点验证标准化目标、事实和恢复状态一致。"""
         children = [
             tool("get_order_details", {"order_id": "#W0000001"}),
-            tool("finish", {"missing": [], "message_hint": "已查询"}),
+            tool("finish", {"missing": [], "note": "已查询"}),
         ]
         async with runtime_factory("format", script, children) as bundle:
             runtime, _, gateway, _, _, _ = bundle
@@ -336,8 +336,8 @@ def test_persistent_read_batch_keeps_reasoning_and_pairs_after_identity_activati
         """认证批次后直接查询两单，再回复，下一轮检查历史编译。"""
         yield lookups
         yield reads
-        yield tool("reply", {"message_hint": "已查询两单。"})
-        yield tool("reply", {"message_hint": "还需要什么帮助？"})
+        yield tool("reply", {"message": "已查询两单。"})
+        yield tool("reply", {"message": "还需要什么帮助？"})
 
     async def scenario():
         """逐项检查消息配对、档案唯一性和编译后的完整思考字段。"""

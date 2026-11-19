@@ -18,6 +18,7 @@ from test_coordinator import (
 from test_coordinator import runtime as runtime
 
 from ttwill.core.context import STATE_NOTICE
+from ttwill.llm import FakeModel
 
 
 def tool_results(fake, name: str) -> list[dict | list]:
@@ -72,6 +73,10 @@ def test_88_confirm_with_pending_task_selection_commits_and_verifies(runtime, ba
         yield tool("complete_plan", {"task_ids": task_ids(state)})
         yield reply()
         yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+
+    def judgments():
+        """独立判定器使用真实 88 轨迹中的明确授权测试响应。"""
         yield text_response(
             json.dumps(
                 [
@@ -85,9 +90,9 @@ def test_88_confirm_with_pending_task_selection_commits_and_verifies(runtime, ba
                 ensure_ascii=False,
             )
         )
-        yield reply()
 
     coordinator, state, gateway, fake, child = runtime(script, cancel_steps("#W0000001"))
+    coordinator.judge.llm.backend = FakeModel(judgments())
     first = turn(coordinator, state, "取消 #W0000001")
     second = turn(coordinator, state, "我全部确认")
     assert second["tasks"][0]["status"] == "done"
@@ -205,6 +210,10 @@ def test_unrelated_confirmation_keeps_same_order_lock(runtime, backend):
             {"changes": [add_task("modify_pending_order_address", "#W0000001", str(ADDRESS))]},
         )
         yield tool("complete_plan", {"task_ids": task_ids(state)})
+        yield reply()
+
+    def judgments():
+        """独立判断本轮只问状态，因此保留尚未确认操作及同单占用。"""
         yield text_response(
             json.dumps(
                 [
@@ -216,9 +225,9 @@ def test_unrelated_confirmation_keeps_same_order_lock(runtime, backend):
                 ]
             )
         )
-        yield reply()
 
     coordinator, state, gateway, fake, child = runtime(script, cancel_steps("#W0000001"))
+    coordinator.judge.llm.backend = FakeModel(judgments())
     turn(coordinator, state, "取消 #W0000001")
     second = turn(coordinator, state, "先告诉我订单状态")
     assert [task["status"] for task in second["tasks"]] == ["pending_confirm", "pending"]

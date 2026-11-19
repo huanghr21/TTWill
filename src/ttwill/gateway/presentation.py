@@ -1,6 +1,5 @@
 """将已核对的业务操作转换成用户可确认的中文详情。"""
 
-import json
 from collections import defaultdict, deque
 from typing import Any
 
@@ -115,7 +114,7 @@ def operation_content(operation: dict, *, original_items: list[dict] | None = No
             未提交订单提供；其他动作不需要传入。
 
     Returns:
-        包含中文动作、办理对象、完整参数与动作相关预期结果的展示文本。
+        包含中文动作、办理对象、完整参数与动作相关预期结果的逐行展示文本。
         商品修改仅列出逐项原商品与新规格，其他订单商品不进入正文；用户
         地址操作仅展示地址预期结果，其他账户资料不进入正文。
 
@@ -132,11 +131,49 @@ def operation_content(operation: dict, *, original_items: list[dict] | None = No
             raise ValueError("修改商品展示需要原始订单商品")
         preview = {**preview, "item_changes": _item_changes(arguments, original_items, preview)}
     expected = {key: preview[key] for key in fields if key in preview}
+    argument_text = "\n".join(_detail_lines(_translate(arguments)))
+    expected_text = "\n".join(_detail_lines(_translate(expected)))
     return (
         f"待确认：{action_label(action)}\n{target}\n\n"
-        f"办理内容：\n{json.dumps(_translate(arguments), ensure_ascii=False, indent=2)}\n\n"
-        f"确认后预期结果：\n{json.dumps(_translate(expected), ensure_ascii=False, indent=2)}"
+        f"办理内容：\n{argument_text}\n\n"
+        f"确认后预期结果：\n{expected_text}"
     )
+
+
+def _detail_lines(value: dict | list, indent: int = 0) -> list[str]:
+    """将业务详情展开为缩进条目，保留嵌套字段、列表顺序与标量原值。
+
+    Args:
+        value: 已翻译字段的业务字典或列表。
+        indent: 当前层级的前导空格数，每深入一层增加两个空格。
+
+    Returns:
+        使用中文冒号和项目符号的文本行；复合列表逐项编号，多行文字的
+        后续行随所属条目缩进，空值显示为中文说明。
+    """
+    prefix = " " * indent
+    if not value:
+        return [f"{prefix}· 无"]
+    entries = (
+        value.items()
+        if isinstance(value, dict)
+        else (
+            (f"第 {index} 项" if isinstance(item, (dict, list)) else None, item)
+            for index, item in enumerate(value, 1)
+        )
+    )
+    lines = []
+    for label, item in entries:
+        heading = f"{prefix}· {label}：" if label is not None else f"{prefix}· "
+        if isinstance(item, (dict, list)):
+            lines.append(heading)
+            lines.extend(_detail_lines(item, indent + 2))
+            continue
+        text = "无" if item is None else "（空）" if item == "" else str(item)
+        first, *rest = text.split("\n")
+        lines.append(f"{heading}{first}")
+        lines.extend(f"{prefix}  {line}" for line in rest)
+    return lines
 
 
 def _item_changes(arguments: dict, original_items: list[dict], preview: dict) -> list[dict]:

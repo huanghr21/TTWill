@@ -81,7 +81,8 @@ def assert_completed_demo(output: dict) -> None:
     }
     confirmations = [event for event in ended if event["kind"] == "confirmation"]
     confirmed = next(event for event in confirmations if event["attrs"]["user_message"] == "确认")
-    assert confirmed["attrs"]["source"] == "rule"
+    assert confirmed["attrs"]["source"] == "model"
+    assert confirmed["attrs"]["assistant_reply"] == first["reply"]
     assert confirmed["attrs"]["displayed"] == [
         {"operation_id": operation_id, "content": shown["content"]}
     ]
@@ -91,7 +92,7 @@ def assert_completed_demo(output: dict) -> None:
         json.loads(path.read_text(encoding="utf-8"))
         for path in Path(output["database"]).parent.glob("models/*.json")
     ]
-    assert len(records) == 11
+    assert len(records) == 12
     assert all(record["response"]["model"] == "fake-demo" for record in records)
     assert all(
         tool["function"]["name"] != "commit"

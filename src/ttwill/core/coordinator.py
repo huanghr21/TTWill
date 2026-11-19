@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ttwill.core.confirmation import ConfirmationJudge
 from ttwill.core.context import STATE_NOTICE
@@ -21,11 +21,14 @@ from ttwill.gateway import (
     SessionContext,
     ToolGateway,
 )
-from ttwill.gateway.presentation import action_label
 from ttwill.llm import LLMClient
 from ttwill.llm.types import LLMError
 
 STOP_NOTICE = "抱歉，这次处理没有完成，请稍后重试或说明是否需要转人工。"
+PREPARED_STOP_NOTICE = (
+    "以下操作已准备好，请核对后确认；其余事项本轮未能处理完，可稍后继续或转人工。"
+)
+COMPLETION_CLAIMS = ("已取消", "已退款", "已退货", "已换货", "已修改", "已提交")
 
 
 class UpdateTasks(BaseModel):
@@ -53,11 +56,19 @@ class DispatchTasks(BaseModel):
 
 
 class Reply(BaseModel):
-    """提供回复要点及要展示的任务，业务状态和操作详情由代码填写。"""
+    """撰写原样发送的客服正文，并选择由代码附加确认卡片的任务。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
-    message_hint: str
+    message: str = Field(min_length=1, description="原样发送给用户的非空回复正文")
     show_task_ids: list[str] | None = None
+
+    @field_validator("message")
+    @classmethod
+    def nonempty_message(cls, value: str) -> str:
+        """拒绝空白回复，保留有效正文的原始空格与换行。"""
+        if not value.strip():
+            raise ValueError("回复正文须包含非空白字符")
+        return value
 
 
 @dataclass
@@ -69,6 +80,7 @@ class ConversationState:
         tasks: 代码维护的任务集合。
         history: 直接调用时的消息历史；持久运行时完整原文另存对话档案。
         last_display: 最近一次助手回复实际展示的操作及参数快照。
+        last_reply: 用户实际收到的上一条完整回复，供确认判定消除正文歧义。
         turn: 已开始处理的用户消息数。
     """
 
@@ -76,6 +88,7 @@ class ConversationState:
     tasks: TaskStore = field(default_factory=TaskStore)
     history: list[dict] = field(default_factory=list)
     last_display: list[dict] = field(default_factory=list)
+    last_reply: str = ""
     turn: int = 0
 
 
@@ -87,6 +100,7 @@ class TurnState:
         user_message: 本轮真实用户原话，独立确认只读取此字段。
         instance_id: 本轮协调实例标识，不参与业务准备的确定性请求键。
         previous: 本轮开始时保留的上一回复实际展示快照。
+        previous_reply: 上一条实际发送的完整回复，保留正文与确认卡片。
         messages: 未压缩的本轮模型与工具往返，持久运行时同时归档。
         base_messages: 初始提示与历史占用的消息数，之后的条目属于本轮往返。
         confirmed: 是否已完成本轮独立确认判定。
@@ -101,6 +115,7 @@ class TurnState:
     previous: list[dict]
     messages: list[dict]
     base_messages: int
+    previous_reply: str = ""
     confirmed: bool = False
     decisions: list[dict] = field(default_factory=list)
     rounds: int = 0
@@ -181,12 +196,21 @@ class Coordinator:
             raise ValueError("用户消息不能为空")
         state.turn += 1
         previous = deepcopy(state.last_display)
+        previous_reply = state.last_reply
         state.last_display = []
+        state.last_reply = ""
         state.history.append({"role": "user", "content": user_message})
         instance_id = uuid4().hex
         self._reconcile(state, CallContext(state.session, "coordinator", instance_id))
         messages = self._messages(state)
-        return TurnState(user_message, instance_id, previous, messages, len(messages))
+        return TurnState(
+            user_message,
+            instance_id,
+            previous,
+            messages,
+            len(messages),
+            previous_reply=previous_reply,
+        )
 
     async def advance_turn(
         self, state: ConversationState, work: TurnState, *, messages: list[dict] | None = None
@@ -223,15 +247,15 @@ class Coordinator:
             self.stop_turn(state, work, f"协调模型调用失败：{type(exc).__name__}")
             return
         calls = response.message.get("tool_calls") or []
-        text = (response.message.get("content") or "").strip()
-        if not calls and text and self._can_reply(state, work):
+        text = response.message.get("content") or ""
+        if not calls and text.strip() and self._can_reply(state, work):
             # 模型常以纯文本回复用户；仅在 reply 工具同样会被接受时按 reply 处理。
             if state.session.user_id is not None:
                 self._reconcile(state, context)
             if state.session.user_id is None or not self._actionable(state):
                 work.messages.append(deepcopy(response.message))
                 work.result = self._reply(
-                    state, context, Reply(message_hint=text), work.decisions, work.rounds
+                    state, context, Reply(message=text), work.decisions, work.rounds
                 )
                 if response.message["content"] == work.result["reply"]:
                     state.history[-1] = deepcopy(response.message)
@@ -315,7 +339,9 @@ class Coordinator:
             plan = CompletePlan.model_validate(arguments)
             if work.confirmed:
                 raise ValueError("本轮已经判定过用户确认")
-            work.decisions = await self._confirm(state, context, work.user_message, work.previous)
+            work.decisions = await self._confirm(
+                state, context, work.user_message, work.previous, work.previous_reply
+            )
             work.confirmed = True
             selected, blocked = self._plan_candidates(state, plan.task_ids)
             dispatched = (
@@ -363,7 +389,7 @@ class Coordinator:
         work.result = self._reply(
             state,
             context,
-            Reply(message_hint=""),
+            Reply(message=STOP_NOTICE),
             work.decisions,
             work.rounds,
             notice=STOP_NOTICE,
@@ -398,13 +424,19 @@ class Coordinator:
             "写任务按订单×动作类型聚合完整商品清单；同单不同动作逐个确认，先地址/支付后商品。"
             "每个任务提供完整 instruction、capability、action，订单动作还要 order_id。"
             "capability 从下方能力目录选择，action 使用该能力业务工具的完整名称。"
-            "模型只提出任务增改撤、missing与message_hint；任何status、revision或确认字段均由代码维护。"
+            "模型只提出任务增改撤与missing；子Agent的note是给你的备注，不是直接回复用户的正文。"
+            "任何status、revision或确认字段均由代码维护。"
             "不能声明写任务完成，不能提交操作，用户确认只由独立判定器读取当前用户原话。"
             "reply 只能在所有任务完成、撤销、等待用户或失败后调用。"
             "show_task_ids为要展示待确认详情的任务，省略展示全部，空列表不展示。"
             "协调工具返回变化摘要；当前完整任务清单只看本次请求附带的权威状态。"
             "其中事实与执行记录只保留关键标识和结果摘要，需要业务明细时重新查询。"
-            "任务结果与操作详情由代码生成，message_hint只作回复要点。\n"
+            "reply.message 是原样发送给用户的非空正文；代码只在正文之后附加所选操作的确认卡片。"
+            "请用自然语言回答问题、解释、追问和汇总办理结果，不贴JSON、内部标识或任务字段名。"
+            "不另造卡片中的办理参数或金额；引用卡片金额解释用户疑问时保持一致。"
+            "写任务核验完成之前不能说已取消、已退款、已退货、已换货、已修改或已提交；"
+            "done只表示该动作已核验，退货申请完成不表示已收到退货或退款到账。"
+            "撤销、失败等变化只在发生的本轮说明；随后用户追问时按实际状态回答。\n"
             + self.gateway.skills.common_policy
             + "\n可分派能力：\n"
             + json.dumps(self.runner.registry.catalog(), ensure_ascii=False)
@@ -587,6 +619,7 @@ class Coordinator:
         context: CallContext,
         user_message: str,
         previous: list[dict],
+        previous_reply: str | None = None,
     ) -> list[dict]:
         """只判定前一条实际回复中仍与当前任务修订一致的操作。
 
@@ -595,6 +628,7 @@ class Coordinator:
             context: 代码提交、拒绝和核验使用的身份。
             user_message: 当前用户原话。
             previous: 上次成功发出的回复的展示快照。
+            previous_reply: 上次实际回复正文与卡片；None 用于独立判定测试入口。
 
         Returns:
             按操作列出的判定、执行状态及核验结果，部分失败不覆盖其他结果。
@@ -603,7 +637,7 @@ class Coordinator:
         if not eligible:
             return []
         # 保留实际展示范围，避免撤销一项后把多项短回复误判为单项确认。
-        judgments = await self.judge.judge(user_message, previous)
+        judgments = await self.judge.judge(user_message, previous, assistant_reply=previous_reply)
         results = []
         for judgment in judgments:
             if judgment["operation_id"] not in eligible:
@@ -839,7 +873,7 @@ class Coordinator:
         context = replace(context, task_id=task.id, revision=task.revision)
         task.actions.extend(deepcopy(result["actions"]))
         task.facts.extend(deepcopy(result["facts"]))
-        task.missing, task.message_hint = result["missing"], result["message_hint"]
+        task.missing, task.note = result["missing"], result["note"]
         operation_ids = list(
             dict.fromkeys(
                 action["operation_id"] for action in result["actions"] if action.get("operation_id")
@@ -992,15 +1026,15 @@ class Coordinator:
         *,
         notice: str | None = None,
     ) -> dict:
-        """用实际状态与后端详情生成回复，成功记录后才保存可确认的展示快照。
+        """原样发送模型正文并附代码生成的确认卡片，记录成功后保存实际回复。
 
         Args:
             state: 当前任务及消息状态。
             context: 刷新展示操作时使用的身份。
-            proposal: 模型要点和希望展示的任务 ID，不含可信业务字段。
+            proposal: 模型正文和希望展示的任务 ID，正文不能替代卡片或执行事实。
             decisions: 本轮逐操作确认与执行结果。
             rounds: 本轮已经使用的协调决策轮数。
-            notice: 面向用户的本轮异常说明；None 表示无需附加通知。
+            notice: 停止本轮时使用的固定说明；None 表示发送模型正文。
 
         Returns:
             回复、任务快照、实际展示项、确认结果与轮数。
@@ -1015,35 +1049,8 @@ class Coordinator:
             or any(key not in state.tasks.tasks for key in selected)
         ):
             raise ValueError("展示任务不存在或重复")
-        lines, displayed = ([notice] if notice else []), []
-        labels = {
-            "pending_confirm": "等待确认",
-            "waiting_info": "需要补充信息",
-            "done": "已完成",
-            "cancelled": "已撤销",
-            "failed": "未完成",
-            "pending": "等待前项操作",
-            "conditional": "等待条件确定",
-            "needs_verification": "等待核对操作结果",
-        }
+        cards, displayed = [], []
         for task in state.tasks.tasks.values():
-            label = task.order_id or "账户资料"
-            lines.append(
-                f"{label} · {action_label(task.action)}：{labels.get(task.status, task.status)}。"
-            )
-            if task.missing:
-                lines.append("需要补充：" + "；".join(task.missing))
-            if task.reason:
-                if not task.reason_internal:
-                    lines.append(task.reason)
-                elif STOP_NOTICE not in lines:
-                    lines.append(STOP_NOTICE)
-            if task.status == "done" and not task.is_write:
-                lines.extend(
-                    json.dumps(fact["result"], ensure_ascii=False)
-                    for fact in task.facts
-                    if "result" in fact
-                )
             if task.status != "pending_confirm" or (
                 selected is not None and task.id not in selected
             ):
@@ -1054,7 +1061,7 @@ class Coordinator:
                 if operation["status"] != "prepared":
                     continue
                 content = self.gateway.operation_content(task_context, operation)
-                lines.append(content)
+                cards.append(content)
                 displayed.append(
                     {
                         "operation_id": operation_id,
@@ -1067,11 +1074,15 @@ class Coordinator:
                         "content": content,
                     }
                 )
+        message = proposal.message
+        if notice is not None:
+            message = PREPARED_STOP_NOTICE if displayed else notice
+        else:
+            self._record_reply_claims(state, message)
+        parts = [message, *cards]
         if displayed:
-            lines.append("请确认以上操作；多项可指明具体操作，或明确回复“全部确认”。")
-        if not lines:
-            lines.append(proposal.message_hint or "请提供邮箱，或姓名和邮编，以便验证身份。")
-        reply = "\n\n".join(lines)
+            parts.append("请确认以上操作；多项可指明具体操作，或明确回复“全部确认”。")
+        reply = "\n\n".join(parts)
         with self.gateway.trace.span(
             "reply", "回复用户", attrs={"content": reply, "displayed": displayed}
         ):
@@ -1081,6 +1092,7 @@ class Coordinator:
         ):
             pass
         state.last_display = deepcopy(displayed)
+        state.last_reply = reply
         state.history.append({"role": "assistant", "content": reply})
         return {
             "reply": reply,
@@ -1089,3 +1101,41 @@ class Coordinator:
             "confirmation_results": decisions,
             "rounds": rounds,
         }
+
+    def _record_reply_claims(self, state: ConversationState, message: str) -> None:
+        """记录正文中的完成措辞及核验状态，供人工分析，不改写或阻断回复。
+
+        Args:
+            state: 本轮可信任务状态，保留动作、目标与最近核验结果作为观察依据。
+            message: 模型原始回复正文；不扫描代码生成的确认卡片。
+        """
+        matched = [word for word in COMPLETION_CLAIMS if word in message]
+        if not matched:
+            return
+        tasks = []
+        for task in state.tasks.tasks.values():
+            if not task.is_write:
+                continue
+            verification = next(
+                (fact["verification"] for fact in reversed(task.facts) if "verification" in fact),
+                {},
+            )
+            tasks.append(
+                {
+                    "task_id": task.id,
+                    "action": task.action,
+                    "order_id": task.order_id,
+                    "status": task.status,
+                    "verification": {
+                        key: deepcopy(verification[key])
+                        for key in ("operation_id", "verified", "reason", "checked_fields")
+                        if key in verification
+                    },
+                }
+            )
+        with self.gateway.trace.span(
+            "reply_claim",
+            "回复完成表述观察",
+            attrs={"message": message, "matched": matched, "tasks": tasks},
+        ):
+            pass

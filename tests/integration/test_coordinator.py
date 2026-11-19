@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 from ttwill.agents import build_registry
 from ttwill.backend.store import orders
 from ttwill.config import AppConfig, LLMConfig, ModelConfig
+from ttwill.core.confirmation import ConfirmationJudge
 from ttwill.core.coordinator import STOP_NOTICE, ConversationState, Coordinator
 from ttwill.core.subagent import SubAgentRunner
 from ttwill.core.tasks import Task
@@ -114,7 +115,7 @@ def prepare_steps(action: str, args: dict, *, skill: str | None = None) -> list[
     return [
         tool("load_skill", {"name": skill or action}),
         tool(action, args),
-        tool("finish", {"missing": [], "message_hint": "已全部成功办理"}),
+        tool("finish", {"missing": [], "note": "已全部成功办理"}),
     ]
 
 
@@ -127,7 +128,7 @@ def cancel_steps(order_id: str) -> list[dict]:
 
 def reply(show_task_ids: list[str] | None = None) -> dict:
     """请求回复并指定展示范围，默认展示全部待确认操作。"""
-    return tool("reply", {"message_hint": "已全部成功办理", "show_task_ids": show_task_ids})
+    return tool("reply", {"message": "已全部成功办理", "show_task_ids": show_task_ids})
 
 
 def task_ids(state: ConversationState, *, status: str | None = None) -> list[str]:
@@ -152,7 +153,7 @@ def by_order(result: dict) -> dict:
 
 @pytest.fixture
 def runtime(tmp_path, backend, skill_catalog):
-    """为每项测试连接真实业务库、子 Agent 和两个独立假模型。
+    """为每项测试连接真实业务库、子 Agent 和三个独立假模型。
 
     Args:
         tmp_path: 测试轨迹和模型原始记录的临时目录。
@@ -186,6 +187,42 @@ def runtime(tmp_path, backend, skill_catalog):
         state = ConversationState(SessionContext("chat"))
         coordinator_fake = FakeModel(script(state))
         child_fake = FakeModel(child_script)
+
+        def judgments():
+            """为现有场景的固定原话提供独立判定，未登记输入立即使测试失败。"""
+            expected = {
+                ("好的", 1): "confirm",
+                ("好的", 2): "unrelated",
+                ("确认", 1): "confirm",
+                ("全部确认", 1): "confirm",
+                ("全部确认", 2): "confirm",
+                ("不用了", 1): "reject",
+                ("不同意", 1): "reject",
+            }
+            consumed = 0
+            while len(judge_fake.requests) > consumed:
+                data = json.loads(judge_fake.requests[consumed]["messages"][-1]["content"])
+                consumed += 1
+                key = data["user_message"], len(data["displayed"])
+                assert key in expected, f"未配置的确认场景：{key}"
+                assert all(
+                    shown["content"] in data["assistant_reply"] for shown in data["displayed"]
+                )
+                yield text_response(
+                    json.dumps(
+                        [
+                            {
+                                "operation_id": shown["operation_id"],
+                                "decision": expected[key],
+                                "reason": "场景预设的明确授权范围",
+                            }
+                            for shown in data["displayed"]
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+
+        judge_fake = FakeModel(judgments())
         llm = LLMClient(config, trace, coordinator_fake)
         runner = SubAgentRunner(
             build_registry(skill_catalog),
@@ -193,7 +230,13 @@ def runtime(tmp_path, backend, skill_catalog):
             LLMClient(config, trace, child_fake),
             max_steps=8,
         )
-        coordinator = Coordinator(gateway, runner, llm, max_rounds=max_rounds)
+        coordinator = Coordinator(
+            gateway,
+            runner,
+            llm,
+            max_rounds=max_rounds,
+            judge=ConfirmationJudge(LLMClient(config, trace, judge_fake)),
+        )
         return coordinator, state, gateway, coordinator_fake, child_fake
 
     return make
@@ -214,7 +257,7 @@ def turn(coordinator: Coordinator, state: ConversationState, message: str) -> di
 
 
 def test_write_completes_only_after_next_turn_confirmation_and_verification(runtime, backend):
-    """首轮准备不能报完成，下一轮真实确认后提交并由核验代码设为 done。"""
+    """模型正文不构成完成证据，下一轮真实确认后提交并由核验代码设为 done。"""
 
     def script(state):
         """首轮验证身份并派工，第二轮确认上一回复中的唯一操作。"""
@@ -230,7 +273,7 @@ def test_write_completes_only_after_next_turn_confirmation_and_verification(runt
     first = turn(coordinator, state, "我是 u1@example.com，请取消订单 #W0000001")
     assert first["tasks"][0]["status"] == "pending_confirm"
     assert len(first["displayed"]) == 1
-    assert "已全部成功办理" not in first["reply"]
+    assert first["reply"].startswith("已全部成功办理")
     assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "pending"
     second = turn(coordinator, state, "好的")
     assert second["tasks"][0]["status"] == "done"
@@ -344,7 +387,7 @@ def test_multiple_orders_require_explicit_scope_and_report_partial_commit_failur
     assert tasks["#W0000001"]["status"] == "done"
     assert tasks["#W0000004"]["status"] == "failed"
     assert tasks["#W0000004"]["reason_internal"] is False
-    assert tasks["#W0000004"]["reason"] in confirmed["reply"]
+    assert confirmed["reply"] == "已全部成功办理"
     assert len(confirmed["confirmation_results"]) == 2
     assert backend.export_snapshot()["orders"]["#W0000001"]["status"] == "cancelled"
     assert backend.export_snapshot()["orders"]["#W0000004"]["status"] == "delivered"
@@ -648,7 +691,7 @@ def test_read_task_requires_facts_for_its_own_action_and_order(
 
     coordinator, state, _, _, _ = runtime(
         script,
-        [tool(query, args), tool("finish", {"missing": [], "message_hint": "订单已查询"})],
+        [tool(query, args), tool("finish", {"missing": [], "note": "订单已查询"})],
     )
     result = turn(coordinator, state, "查询 #W0000001")
     assert result["tasks"][0]["status"] == expected_status
@@ -787,7 +830,7 @@ def test_unverified_identity_request_replies_in_one_round(runtime, plain_text):
 
     def script(state):
         """复现首轮未提供身份时模型生成的合理询问。"""
-        yield text_response(message) if plain_text else tool("reply", {"message_hint": message})
+        yield text_response(message) if plain_text else tool("reply", {"message": message})
 
     coordinator, state, gateway, fake, child = runtime(script, [])
     result = turn(coordinator, state, "我想换一下收到的商品")
@@ -866,8 +909,9 @@ def test_actionable_task_cannot_reply_early_and_internal_reason_stays_hidden(run
     second = turn(coordinator, state, "请告诉我办理情况")
     assert second["tasks"][0]["reason"] == task["reason"]
     assert child.requests == []
+    assert first["reply"] == STOP_NOTICE
+    assert second["reply"] == "已全部成功办理"
     for result in (first, second):
-        assert STOP_NOTICE in result["reply"]
         assert task["reason"] not in result["reply"]
         assert "已经办理完成" not in result["reply"]
     events = [json.loads(line) for line in gateway.trace.path.read_text().splitlines()]
@@ -891,7 +935,7 @@ def test_dispatched_query_receives_verified_identity(runtime):
         script,
         [
             tool("get_order_details", {"order_id": "#W0000001"}),
-            tool("finish", {"missing": [], "message_hint": "已查询订单"}),
+            tool("finish", {"missing": [], "note": "已查询订单"}),
         ],
     )
     result = turn(coordinator, state, "邮箱 u1@example.com，帮我查询订单 #W0000001")
@@ -932,7 +976,8 @@ def test_task_change_clears_internal_reason_visibility(runtime, operation):
     assert second["tasks"][0]["reason_internal"] is False
     assert STOP_NOTICE not in second["reply"]
     if operation == "cancel":
-        assert "用户决定保留订单" in second["reply"]
+        assert second["reply"] == "已全部成功办理"
+        assert second["tasks"][0]["reason"] == "用户决定保留订单"
     else:
         assert second["tasks"][0]["reason"] is None
         assert len(second["displayed"]) == 1
@@ -1163,7 +1208,7 @@ def test_invalid_plan_parameter_structure_precedes_confirmation_side_effects(
     )
     original_confirm = coordinator._confirm
 
-    async def observe_confirmation(state, context, user_message, previous):
+    async def observe_confirmation(state, context, user_message, previous, previous_reply=None):
         """记录确认的真实来源，继续执行原有确认与提交逻辑。
 
         Args:
@@ -1171,12 +1216,13 @@ def test_invalid_plan_parameter_structure_precedes_confirmation_side_effects(
             context: 当前协调者的可信调用身份。
             user_message: 本轮入口收到的真实用户原话。
             previous: 最近一次实际回复展示的完整快照。
+            previous_reply: 上次实际回复正文和卡片，用于短答消歧。
 
         Returns:
             原确认器给出的逐项判定与执行结果。
         """
         confirmations.append((user_message, previous))
-        return await original_confirm(state, context, user_message, previous)
+        return await original_confirm(state, context, user_message, previous, previous_reply)
 
     monkeypatch.setattr(coordinator, "_confirm", observe_confirmation)
     first = turn(coordinator, state, "取消 #W0000001")

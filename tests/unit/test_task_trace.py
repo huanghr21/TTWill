@@ -69,7 +69,9 @@ def trace_runtime(
 def test_confirmation_records_real_task_revision(trace_runtime, message, kind, status) -> None:
     """确认提交或拒绝改修订后的任务，轨迹保留真实任务 ID 和修订号。"""
     coordinator, state, context = trace_runtime
-    previous = coordinator._reply(state, context, Reply(message_hint=""), [], 1)["displayed"]
+    previous = coordinator._reply(state, context, Reply(message="请核对以下取消操作。"), [], 1)[
+        "displayed"
+    ]
     state.turn = 2
     result = asyncio.run(coordinator._confirm(state, context, message, previous))
     assert result[0]["status"] == status
@@ -108,9 +110,7 @@ def test_dispatch_records_exact_instruction(trace_runtime) -> None:
     coordinator, state, _ = trace_runtime
     message = {
         "role": "assistant",
-        "content": json.dumps(
-            {"missing": ["订单号"], "message_hint": "请补充订单号"}, ensure_ascii=False
-        ),
+        "content": json.dumps({"missing": ["订单号"], "note": "请补充订单号"}, ensure_ascii=False),
     }
     coordinator.runner.llm.backend = FakeModel(
         [{"model": "fake", "choices": [{"finish_reason": "stop", "message": message}]}]

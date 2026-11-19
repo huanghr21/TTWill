@@ -57,6 +57,7 @@ def reconcile_restored_tasks(
             recovered.append((task, task_context, operation))
 
         state.last_display = []
+        state.last_reply = ""
         for task in state.tasks.tasks.values():
             if not task.is_write and task.status == "running":
                 task.status = "conditional" if task.condition else "pending"

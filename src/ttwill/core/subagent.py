@@ -43,24 +43,24 @@ class DispatchTask:
 
 
 class FinishPayload(BaseModel):
-    """限制模型只报告信息缺口和回复要点。
+    """限制模型只报告信息缺口和供协调者参考的备注。
 
     Attributes:
         missing: 继续办理所缺少的信息，空列表表示模型未发现缺口。
-        message_hint: 供协调者组织回复的要点，不作为业务执行证据。
+        note: 供协调者组织回复的要点，不作为业务执行证据。
     """
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     missing: list[str]
-    message_hint: str
+    note: str
 
 
 FINISH_TOOL = {
     "type": "function",
     "function": {
         "name": "finish",
-        "description": "结束当前任务，只提供缺少的信息和回复要点；须单独调用。",
+        "description": "结束当前任务，只提供缺少的信息和供协调者参考的备注；须单独调用。",
         "parameters": FinishPayload.model_json_schema(),
     },
 }
@@ -118,7 +118,7 @@ class SubAgentRunner:
 
         Returns:
             包含任务与实例标识、status、actions、facts、missing、
-            pending_confirmation 和 message_hint 的字典。待确认详情来自
+            pending_confirmation 和 note 的字典。待确认详情来自
             后端记录；写任务不会在本阶段返回 done。
 
         Raises:
@@ -195,7 +195,7 @@ class SubAgentRunner:
             f"可用 Skill 目录：{json.dumps(catalog, ensure_ascii=False)}\n"
             "调用写工具前先加载对应 Skill。写工具只准备操作，等待用户确认后才能提交。"
             "完成查询、准备操作或发现信息缺口后，单独调用 finish，参数仅含 missing"
-            "（字符串列表）和 message_hint（回复要点字符串）。也可返回同结构 JSON。"
+            "（字符串列表）和 note（供协调者参考的备注字符串）。也可返回同结构 JSON。"
             "任务状态、动作、业务事实与待确认详情由运行代码填写。"
             "已有事实仅含摘要，办理所需商品、价格及订单细节请重新查询。"
         )
@@ -245,7 +245,7 @@ class SubAgentRunner:
                         None,
                     )
                 except ValidationError as exc:
-                    reason = f"结束内容须只包含 missing 和 message_hint：{exc}"
+                    reason = f"结束内容须只包含 missing 和 note：{exc}"
                     self._blocked(context, "invalid_finish", reason)
                     messages.append({"role": "user", "content": reason})
                     continue
@@ -384,13 +384,13 @@ class SubAgentRunner:
         Args:
             context: 结果中的固定执行身份，以及网关记录的筛选范围。
             task: 任务标识、修订号和读写类型。
-            payload: 经严格校验的信息缺口与回复要点；None 表示循环未正常结束。
+            payload: 经严格校验的信息缺口与供协调者参考的备注；None 表示循环未正常结束。
             steps: 已实际消耗的模型响应或工具调用步数。
             failure: 循环生成的失败原因；None 表示根据工具记录判断执行状态。
 
         Returns:
             包含固定身份、状态、写尝试 actions、查询事实 facts、信息缺口
-            missing、待确认列表 pending_confirmation、回复要点、失败原因和
+            missing、待确认列表 pending_confirmation、供协调者参考的备注、失败原因和
             步数的字典。actions 保留实际调用结果；待确认操作采用对账后的
             参数与预览，代码对账读取本身不计作新的写尝试。
         """
@@ -473,7 +473,7 @@ class SubAgentRunner:
             "facts": facts,
             "missing": deepcopy(missing),
             "pending_confirmation": pending,
-            "message_hint": payload.message_hint if payload else "",
+            "note": payload.note if payload else "",
             "reason": failure,
             "steps": steps,
         }

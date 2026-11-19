@@ -151,7 +151,7 @@ def test_unavailable_variant_activates_return_then_requires_confirmation(accepta
                 "finish",
                 {
                     "missing": ["指定规格无库存，需采用备用退货方案"],
-                    "message_hint": "指定的绿色橡胶水管无库存。",
+                    "note": "指定的绿色橡胶水管无库存。",
                 },
             ),
             *prepare_steps(

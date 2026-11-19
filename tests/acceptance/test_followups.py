@@ -94,7 +94,7 @@ def test_changed_order_rejects_old_operation_and_waits_for_new_confirmation(acce
             assert changed["confirmation_results"] == []
             assert case.snapshot() == case.seed
             assert changed["displayed"][0]["args"]["order_id"] == SECOND_ORDER
-            assert "等待确认" in changed["reply"]
+            assert "待确认" in changed["reply"]
 
             confirmed = await case.send(runtime, "确认")
             assert confirmed["tasks"][0]["status"] == "done"
@@ -121,7 +121,7 @@ def test_missing_cancel_reason_is_collected_before_prepare_and_confirmation(acce
         )
         yield tool("complete_plan", {})
         yield tool("dispatch_tasks", {"task_ids": task_ids(tasks)})
-        yield reply()
+        yield tool("reply", {"message": "请补充取消原因：不再需要，还是误下单？"})
         yield tool(
             "update_tasks",
             {
@@ -149,7 +149,7 @@ def test_missing_cancel_reason_is_collected_before_prepare_and_confirmation(acce
                 "finish",
                 {
                     "missing": ["取消原因：不再需要或误下单"],
-                    "message_hint": "请告知是因为不再需要，还是误下单",
+                    "note": "请告知是因为不再需要，还是误下单",
                 },
             ),
         ] + prepare_steps(CANCEL, {"order_id": THIRD_ORDER, "reason": "ordered by mistake"})

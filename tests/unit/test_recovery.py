@@ -60,6 +60,7 @@ def state(gateway: ToolGateway) -> ConversationState:
         status="running",
     )
     result.last_display = [{"session_id": "old-chat", "content": "请确认取消订单"}]
+    result.last_reply = "这是旧聊天的取消说明。\n\n请确认取消订单"
     return result
 
 
@@ -104,6 +105,7 @@ def test_prepare_without_checkpoint_reference_is_found_and_not_authorized(
     assert task.status == "pending_confirm"
     assert task.revision == 1
     assert state.last_display == []
+    assert state.last_reply == ""
     assert task.actions[-1]["result"] == operation
     assert gateway.backend.export_snapshot() == before
     assert not any(record["kind"] == "commit" for record in gateway.records)
@@ -251,6 +253,7 @@ def test_done_task_is_not_repeated_or_reverified(
     assert task.to_dict() == before
     assert len(gateway.records) == record_count
     assert state.last_display == []
+    assert state.last_reply == ""
 
 
 def test_unverified_identity_cannot_recover(gateway: ToolGateway, state: ConversationState) -> None:
@@ -258,10 +261,12 @@ def test_unverified_identity_cannot_recover(gateway: ToolGateway, state: Convers
     prepare(gateway, state)
     state.session.user_id = None
     before = state.tasks.snapshot()
+    previous_reply = state.last_reply
     with pytest.raises(BusinessError, match="重新验证") as caught:
         recover(state, gateway)
     assert caught.value.code == "identity_required"
     assert state.tasks.snapshot() == before
+    assert state.last_reply == previous_reply
 
 
 def test_wrong_verified_user_cannot_read_or_modify_recovered_operations(
@@ -276,10 +281,12 @@ def test_wrong_verified_user_cannot_read_or_modify_recovered_operations(
         {"email": "u2@example.com"},
     )
     before = state.tasks.snapshot()
+    previous_reply = state.last_reply
     with pytest.raises(BusinessError) as caught:
         recover(state, gateway)
     assert caught.value.code == "forbidden"
     assert state.tasks.snapshot() == before
+    assert state.last_reply == previous_reply
     assert (
         gateway.backend.get_operation("u1", operation_id=operation["operation_id"])["status"]
         == "prepared"

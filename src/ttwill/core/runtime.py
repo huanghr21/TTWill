@@ -274,6 +274,7 @@ class PersistentRuntime:
                 pass
             # 新聊天没有旧授权；本轮原话只可确认本聊天上一条实际展示。
             work.previous = []
+            work.previous_reply = ""
             work.decisions = []
             if work.result is not None:
                 self.coordinator.stop_turn(
@@ -600,6 +601,7 @@ def _snapshot(state: ConversationState) -> dict:
         "session_id": state.session.session_id,
         "tasks": state.tasks.snapshot(),
         "last_display": deepcopy(state.last_display),
+        "last_reply": state.last_reply,
         "turn": state.turn,
     }
 
@@ -618,5 +620,6 @@ def _conversation(snapshot: dict, session: SessionContext) -> ConversationState:
     tasks = [Task(**deepcopy(item)) for item in snapshot["tasks"]]
     state.tasks.tasks = {task.id: task for task in tasks}
     state.last_display = deepcopy(snapshot["last_display"])
+    state.last_reply = snapshot["last_reply"]
     state.turn = snapshot["turn"]
     return state
