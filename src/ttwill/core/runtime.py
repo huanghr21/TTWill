@@ -319,8 +319,13 @@ class PersistentRuntime:
                 for index, message in enumerate(work.messages[work.base_messages :])
             ],
         ]
-        _append_reply(messages, work)
-        self.archive.append_messages(self.thread_id, session.user_id, messages, turn=turn)
+        reply_id = _append_reply(messages, work)
+        dialogue_ids = {f"{work.instance_id}:user"}
+        if reply_id is not None:
+            dialogue_ids.add(reply_id)
+        self.archive.append_messages(
+            self.thread_id, session.user_id, messages, turn=turn, dialogue_ids=dialogue_ids
+        )
         for index, message in enumerate(work.invalid_outputs):
             self.archive.append(
                 self.thread_id,
@@ -490,6 +495,7 @@ class PersistentRuntime:
             f"{work.instance_id}:user",
             {"role": "user", "content": work.user_message},
             turn=state.turn,
+            dialogue=True,
         )
         return {"conversation": _snapshot(state), "work": asdict(work)}
 
@@ -525,6 +531,7 @@ class PersistentRuntime:
                     current_turn=state.turn,
                     tools=self.coordinator._schemas(state, work),
                     current_messages=work.messages[work.base_messages :],
+                    business_data=work.business_snapshot,
                 )
             except (ContextBudgetExceeded, LLMError, TimeoutError) as exc:
                 reason = str(exc) if isinstance(exc, ContextBudgetExceeded) else type(exc).__name__
@@ -545,9 +552,13 @@ class PersistentRuntime:
             (f"{work.instance_id}:message:{index}", message)
             for index, message in enumerate(work.messages[offset:], start=offset)
         ]
-        _append_reply(messages_to_archive, work)
+        reply_id = _append_reply(messages_to_archive, work)
         self.archive.append_messages(
-            self.thread_id, state.session.user_id, messages_to_archive, turn=state.turn
+            self.thread_id,
+            state.session.user_id,
+            messages_to_archive,
+            turn=state.turn,
+            dialogue_ids={reply_id} if reply_id is not None else None,
         )
         for index, message in enumerate(
             work.invalid_outputs[invalid_offset:], start=invalid_offset
@@ -568,15 +579,18 @@ class PersistentRuntime:
         return "wait" if values.get("result") is not None else "advance"
 
 
-def _append_reply(entries: list[tuple[str, dict]], work: TurnState) -> None:
+def _append_reply(entries: list[tuple[str, dict]], work: TurnState) -> str | None:
     """向归档批次补入最终回复，模型原文已是实际回复时保留该条而不重复追加。
 
     Args:
         entries: 本次待归档的事件标识与消息列表，原地追加需要补存的回复。
         work: 当前协调进度；未产生最终回复时不追加。模型原文中的思考字段保留。
+
+    Returns:
+        实际发送回复对应的档案事件 ID；本轮尚未回复时为 None。
     """
     if work.result is None:
-        return
+        return None
     reply = work.result["reply"]
     last = entries[-1][1] if entries else {}
     if (
@@ -584,8 +598,10 @@ def _append_reply(entries: list[tuple[str, dict]], work: TurnState) -> None:
         and not last.get("tool_calls")
         and last.get("content") == reply
     ):
-        return
-    entries.append((f"{work.instance_id}:reply", {"role": "assistant", "content": reply}))
+        return entries[-1][0]
+    event_id = f"{work.instance_id}:reply"
+    entries.append((event_id, {"role": "assistant", "content": reply}))
+    return event_id
 
 
 def _snapshot(state: ConversationState) -> dict:
@@ -602,6 +618,7 @@ def _snapshot(state: ConversationState) -> dict:
         "tasks": state.tasks.snapshot(),
         "last_display": deepcopy(state.last_display),
         "last_reply": state.last_reply,
+        "business_data": deepcopy(state.business_data),
         "turn": state.turn,
     }
 
@@ -621,5 +638,6 @@ def _conversation(snapshot: dict, session: SessionContext) -> ConversationState:
     state.tasks.tasks = {task.id: task for task in tasks}
     state.last_display = deepcopy(snapshot["last_display"])
     state.last_reply = snapshot["last_reply"]
+    state.business_data = deepcopy(snapshot["business_data"])
     state.turn = snapshot["turn"]
     return state

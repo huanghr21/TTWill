@@ -9,6 +9,8 @@ max_rounds = 8
 [context]
 # 计入消息与工具定义的 JSON 字符数，不是模型 token 数。
 max_chars = 64000
+# 业务数据与需重查提示共用的独立字符预算。
+data_max_chars = 16000
 recent_turns = 4
 summary_tier = "flash"
 

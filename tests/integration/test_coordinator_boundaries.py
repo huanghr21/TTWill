@@ -345,12 +345,16 @@ def test_persistent_read_batch_keeps_reasoning_and_pairs_after_identity_activati
             runtime, _, gateway, fake, child, archive = bundle
             result = await runtime.receive_message("u1@example.com，查两单")
             assert result["rounds"] == 3 and child.requests == []
+            first_turn_requests = list(fake.requests)
             await runtime.receive_message("谢谢")
             archived = [entry["payload"] for entry in archive.messages("thread", "u1")]
             for response in (lookups, reads):
                 original = response["choices"][0]["message"]
                 assert archived.count(original) == 1
-                assert fake.requests[-1]["messages"].count(original) == 1
+                assert any(
+                    request["messages"].count(original) == 1 for request in first_turn_requests
+                )
+                assert original not in fake.requests[-1]["messages"]
                 index = archived.index(original)
                 following = archived[index + 1 : index + 3]
                 assert [message["tool_call_id"] for message in following] == ["batch_0", "batch_1"]

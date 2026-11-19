@@ -53,27 +53,35 @@ def facts_view(facts: list[dict]) -> list[dict]:
 
 
 def task_view(task: dict) -> dict:
-    """生成一次模型决策所需的任务状态，不携带完整业务对象与操作预览。
+    """按活跃或终态投影任务，业务事实和完整操作历史不进入模型输入。
 
     Args:
         task: 来自当前可信任务状态的完整快照。
 
     Returns:
-        保留请求、修订、状态、操作引用及精简事实和动作的独立字典；不能用于恢复。
+        活跃任务保留请求字段与当前修订的 operations 标识、状态；没有实际记录
+        的操作状态为 None。终态只保留任务标识、动作、订单、状态与原因字段。
+        返回值与完整任务隔离，不能用于恢复。
     """
-    view = {key: deepcopy(value) for key, value in task.items() if key not in {"facts", "actions"}}
-    view["facts"] = facts_view(task.get("facts", []))
-    view["actions"] = []
+    fields = ("id", "action", "order_id", "status", "reason", "reason_internal")
+    terminal = task["status"] in {"done", "cancelled", "failed"}
+    if not terminal:
+        fields += ("capability", "instruction", "condition", "revision", "missing", "note")
+    view = {key: deepcopy(task[key]) for key in fields}
+    if terminal:
+        return view
+    statuses = {}
     for action in task.get("actions", []):
         operation = action.get("result")
         operation = operation if isinstance(operation, dict) else {}
-        brief = {key: deepcopy(action[key]) for key in ("kind", "tool") if key in action}
-        for key in ("operation_id", "status", "args", "reason"):
-            if key in action or key in operation:
-                brief[key] = deepcopy(action[key] if key in action else operation[key])
-        if "tool" not in brief and "action" in operation:
-            brief["tool"] = operation["action"]
-        view["actions"].append(brief)
+        operation_id = operation.get("operation_id", action.get("operation_id"))
+        status = operation.get("status", action.get("status"))
+        if operation_id is not None and status is not None:
+            statuses[operation_id] = status
+    view["operations"] = [
+        {"operation_id": operation_id, "status": statuses.get(operation_id)}
+        for operation_id in task["operation_ids"]
+    ]
     return view
 
 

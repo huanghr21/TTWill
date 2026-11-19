@@ -45,7 +45,11 @@ def test_projected_requests_keep_full_checkpoint_and_confirmable_operation(runti
                 for task in states[0]["tasks"]:
                     encoded = json.dumps(task)
                     assert '"preview"' not in encoded and '"expected"' not in encoded
-                    assert all("result" not in action for action in task["actions"])
+                    assert "facts" not in task and "actions" not in task
+                    assert all(
+                        set(operation) == {"operation_id", "status"}
+                        for operation in task.get("operations", [])
+                    )
             entries = archive.messages("thread", "u1")
             assert not any(
                 str(entry["payload"].get("content", "")).startswith(STATE_NOTICE)

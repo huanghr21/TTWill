@@ -1,4 +1,4 @@
-"""验证上下文预算、历史引用、一次摘要与权威输入的完整保留。"""
+"""验证五区上下文、纯对话历史、一次摘要与本轮输入的完整保留。"""
 
 import asyncio
 import json
@@ -7,6 +7,7 @@ import pytest
 
 from ttwill.config import AppConfig, LLMConfig, ModelConfig
 from ttwill.core.context import (
+    DATA_NOTICE,
     STATE_NOTICE,
     SUMMARY_NOTICE,
     ContextBudgetExceeded,
@@ -83,8 +84,10 @@ def compile_context(compiler: ContextCompiler, **overrides) -> list[dict]:
 
 
 def add_message(archive: Archive, event_id: str, text: str, turn: int, role: str = "user") -> None:
-    """在固定用户与线程中保存指定轮次的完整消息。"""
-    archive.append_message("thread", "u1", event_id, {"role": role, "content": text}, turn=turn)
+    """在固定用户与线程中保存并标记指定轮次的实际对话。"""
+    archive.append_message(
+        "thread", "u1", event_id, {"role": role, "content": text}, turn=turn, dialogue=True
+    )
 
 
 def test_small_context_keeps_exact_inputs_without_model_call(runtime):
@@ -101,14 +104,15 @@ def test_small_context_keeps_exact_inputs_without_model_call(runtime):
         "上一轮回复",
     ]
     assert result[-2]["content"] == STATE_NOTICE + '[{"id":"t","status":"pending_confirm"}]'
+    assert result[-3] == {"role": "system", "content": DATA_NOTICE + "[]"}
     assert result[-1] == {"role": "user", "content": "当前只改地址，不要取消订单"}
     result[-2]["content"] = "外部改动"
     assert snapshot == [{"id": "t", "status": "pending_confirm"}]
     assert not fake.requests
 
 
-def test_old_tool_result_is_referenced_before_any_summary(runtime):
-    """旧工具正文引用化保留调用配对及各轮思考字段，档案原文仍可回查。"""
+def test_internal_history_stays_archived_without_entering_dialogue(runtime):
+    """内部调用、错误和同文未标记消息不进入跨轮上下文，完整档案仍可回查。"""
     compiler, archive, fake = runtime(budget=1100)
     call = {
         "role": "assistant",
@@ -126,22 +130,29 @@ def test_old_tool_result_is_referenced_before_any_summary(runtime):
         "content": "订单已查询。",
         "reasoning_content": "测试近期无工具回复的思考标记",
     }
-    archive.append_message("thread", "u1", "recent", recent, turn=2)
+    archive.append_message("thread", "u1", "recent", recent, turn=2, dialogue=True)
+    archive.append_message(
+        "thread", "u1", "internal-recent", {"role": "assistant", "content": "内部拒绝"}, turn=2
+    )
+    archive.append_message("thread", "u1", "unmarked-copy", recent, turn=2)
     result = compile_context(compiler)
-    tool = next(message for message in result if message["role"] == "tool")
-    assert json.loads(tool["content"])["archive_reference"] == "result"
-    assert tool["tool_call_id"] == "call1"
-    assert call in result
-    assert recent in result
+    assert all(message["role"] != "tool" for message in result)
+    assert call not in result
+    assert result.count(recent) == 1
+    assert "内部拒绝" not in str(result)
+    assert "_ttwill_dialogue" not in str(result)
     assert archive.get_event("thread", "u1", "call")["payload"] == call
     assert archive.get_event("thread", "u1", "result")["payload"] == original
     assert context_chars(result) <= 1100
     assert not fake.requests
 
 
-def test_summary_removes_whole_old_tool_round_and_preserves_recent_thinking(runtime):
-    """整轮摘要同时移除旧调用和结果，保留近期工具往返的完整思考与配对。"""
-    compiler, archive, fake = runtime([response("此前已查询第一笔订单。")], budget=1000)
+def test_summary_reads_only_dialogue_and_preserves_current_tool_exchange(runtime):
+    """历史只摘要真实对话，本轮调用的思考、工具结果和错误则原样保留。"""
+    compiler, archive, fake = runtime([response("此前已查询第一笔订单。")], budget=1500)
+    add_message(archive, "old-user", "真实用户旧原话" * 500, 1)
+    add_message(archive, "old-reply", "真实助手旧回复", 1, "assistant")
+    add_message(archive, "recent-user", "真实用户近期原话", 2)
     old_call = {
         "role": "assistant",
         "content": None,
@@ -151,37 +162,76 @@ def test_summary_removes_whole_old_tool_round_and_preserves_recent_thinking(runt
         ],
     }
     old_result = {"role": "tool", "tool_call_id": "old-call", "content": "旧查询结果" * 500}
-    recent_call = {
+    current_call = {
         "role": "assistant",
         "content": None,
-        "reasoning_content": "近期思考标记",
+        "reasoning_content": "本轮思考标记",
         "tool_calls": [
             {
-                "id": "recent-call",
+                "id": "current-call",
                 "type": "function",
                 "function": {"name": "query", "arguments": "{}"},
             }
         ],
     }
-    recent_result = {"role": "tool", "tool_call_id": "recent-call", "content": "近期查询结果"}
+    current_result = {"role": "tool", "tool_call_id": "current-call", "content": "本轮查询错误"}
     for event_id, message, turn in (
         ("old-call", old_call, 1),
         ("old-result", old_result, 1),
-        ("recent-call", recent_call, 2),
-        ("recent-result", recent_result, 2),
+        ("recent-error", {"role": "assistant", "content": "近期内部错误噪声"}, 2),
     ):
         archive.append_message("thread", "u1", event_id, message, turn=turn)
 
-    messages = compile_context(compiler)
+    business = [{"kind": "order", "id": "#1", "status": "历史业务状态"}]
+    messages = compile_context(
+        compiler, current_messages=[current_call, current_result], business_data=business
+    )
 
     assert len(fake.requests) == 1
     assert messages[1]["content"] == SUMMARY_NOTICE + "\n此前已查询第一笔订单。"
-    assert recent_call in messages
-    assert recent_result in messages
+    assert messages[-2:] == [current_call, current_result]
+    assert "真实用户近期原话" in str(messages)
+    assert "近期内部错误噪声" not in str(messages)
     assert "old-call" not in json.dumps(messages)
-    assert context_chars(messages) <= 1000
+    summary_request = json.loads(fake.requests[0]["messages"][-1]["content"])
+    assert summary_request["history"] == [
+        {"role": "user", "content": "真实用户旧原话" * 500},
+        {"role": "assistant", "content": "真实助手旧回复"},
+    ]
+    assert "历史业务状态" not in str(summary_request)
+    assert "本轮查询错误" not in str(summary_request)
+    assert context_chars(messages) <= 1500
     assert archive.get_event("thread", "u1", "old-call")["payload"] == old_call
     assert archive.get_event("thread", "u1", "old-result")["payload"] == old_result
+
+
+def test_business_data_has_fixed_position_and_cannot_change_input(runtime):
+    """业务数据置于实际对话之后和权威快照之前，明确本轮新结果优先。"""
+    compiler, archive, fake = runtime()
+    add_message(archive, "old", "用户历史原话", 1)
+    add_message(archive, "recent", "已展示历史卡片", 2, "assistant")
+    data = [{"kind": "order", "id": "#1", "data": {"status": "pending"}}]
+    current = [{"role": "tool", "tool_call_id": "c", "content": "新状态：delivered"}]
+    result = compile_context(compiler, business_data=data, current_messages=current)
+    assert [message["role"] for message in result] == [
+        "system",
+        "user",
+        "assistant",
+        "system",
+        "system",
+        "user",
+        "tool",
+    ]
+    assert result[3]["content"].startswith(DATA_NOTICE)
+    assert json.loads(result[3]["content"][len(DATA_NOTICE) :]) == data
+    assert "本轮工具返回的新结果优先" in result[3]["content"]
+    assert result[4]["content"].startswith(STATE_NOTICE)
+    assert result[-1] == current[0]
+    result[3]["content"] = "外部改动"
+    result[-1]["content"] = "外部改动"
+    assert data[0]["data"]["status"] == "pending"
+    assert current[0]["content"] == "新状态：delivered"
+    assert not fake.requests
 
 
 def test_summary_is_single_call_marked_reference_and_reused(runtime):
@@ -200,12 +250,16 @@ def test_summary_is_single_call_marked_reference_and_reused(runtime):
     assert len(saved) == 1
     assert "task_snapshot" not in saved[0]["payload"]
     add_message(archive, "recent3", "最新一轮话", 3)
+    archive.append_message(
+        "thread", "u1", "internal-late", {"role": "assistant", "content": "内部错误" * 500}, turn=1
+    )
     second = compile_context(compiler, current_turn=4)
     assert second[1] == first[1]
     assert "近期话" in str(second)
     assert "最新一轮话" in str(second)
     assert len(fake.requests) == 1
-    assert len(archive.messages("thread", "u1")) == 3
+    assert len(archive.messages("thread", "u1")) == 4
+    assert len(archive.dialogue_messages("thread", "u1")) == 3
 
 
 def test_summary_is_reusable_after_reopening_archive(runtime):
@@ -236,7 +290,9 @@ def test_additional_old_history_triggers_one_new_summary_when_needed(runtime):
     assert len(archive.entries("thread", "u1", kind="summary")) == 2
 
 
-@pytest.mark.parametrize("field", ["task_snapshot", "current_message", "current_messages", "tools"])
+@pytest.mark.parametrize(
+    "field", ["task_snapshot", "current_message", "current_messages", "business_data", "tools"]
+)
 def test_authoritative_and_current_content_is_never_truncated(runtime, field):
     """当前任务、原话、本轮工具往返和工具定义超限时明确失败，不截断或调用摘要。"""
     compiler, archive, fake = runtime(budget=500)
@@ -245,6 +301,7 @@ def test_authoritative_and_current_content_is_never_truncated(runtime, field):
         "task_snapshot": [{"instruction": "任务原文" * 500}],
         "current_message": "本轮原话" * 500,
         "current_messages": [{"role": "tool", "content": "本轮结果" * 500, "tool_call_id": "c"}],
+        "business_data": [{"data": "历史业务数据" * 500}],
         "tools": [{"description": "工具定义" * 500}],
     }
     with pytest.raises(ContextBudgetExceeded):
@@ -286,7 +343,12 @@ def test_other_owner_history_and_summary_are_never_loaded(runtime):
     """编译上下文不能加载其他用户的原文或摘要。"""
     compiler, archive, fake = runtime()
     archive.append_message(
-        "thread", "u2", "private", {"role": "user", "content": "另一用户秘密"}, turn=1
+        "thread",
+        "u2",
+        "private",
+        {"role": "user", "content": "另一用户秘密"},
+        turn=1,
+        dialogue=True,
     )
     archive.append("thread", "u2", "summary", "summary", {"text": "另一用户秘密摘要"})
     result = compile_context(compiler)

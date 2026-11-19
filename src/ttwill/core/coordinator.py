@@ -8,8 +8,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ttwill.core.business_data import business_updates, limit_business_data
 from ttwill.core.confirmation import ConfirmationJudge
-from ttwill.core.context import STATE_NOTICE
+from ttwill.core.context import DATA_NOTICE, STATE_NOTICE
 from ttwill.core.subagent import DispatchTask, SubAgentRunner
 from ttwill.core.task_view import task_brief, task_view
 from ttwill.core.tasks import Task, TaskChange, TaskStore
@@ -81,6 +82,7 @@ class ConversationState:
         history: 直接调用时的消息历史；持久运行时完整原文另存对话档案。
         last_display: 最近一次助手回复实际展示的操作及参数快照。
         last_reply: 用户实际收到的上一条完整回复，供确认判定消除正文歧义。
+        business_data: 按实体去重的业务参考数据，随检查点保存，不作为授权或执行事实。
         turn: 已开始处理的用户消息数。
     """
 
@@ -89,6 +91,7 @@ class ConversationState:
     history: list[dict] = field(default_factory=list)
     last_display: list[dict] = field(default_factory=list)
     last_reply: str = ""
+    business_data: dict[str, dict] = field(default_factory=dict)
     turn: int = 0
 
 
@@ -101,6 +104,7 @@ class TurnState:
         instance_id: 本轮协调实例标识，不参与业务准备的确定性请求键。
         previous: 本轮开始时保留的上一回复实际展示快照。
         previous_reply: 上一条实际发送的完整回复，保留正文与确认卡片。
+        business_snapshot: 轮初冻结的业务数据区，本轮新结果通过工具往返传递。
         messages: 未压缩的本轮模型与工具往返，持久运行时同时归档。
         base_messages: 初始提示与历史占用的消息数，之后的条目属于本轮往返。
         confirmed: 是否已完成本轮独立确认判定。
@@ -116,6 +120,7 @@ class TurnState:
     messages: list[dict]
     base_messages: int
     previous_reply: str = ""
+    business_snapshot: list[dict] = field(default_factory=list)
     confirmed: bool = False
     decisions: list[dict] = field(default_factory=list)
     rounds: int = 0
@@ -135,6 +140,7 @@ class Coordinator:
         max_rounds: int,
         model_tier: str = "flash",
         judge: ConfirmationJudge | None = None,
+        data_max_chars: int = 16000,
     ) -> None:
         """绑定本次运行的业务网关、子 Agent 和模型。
 
@@ -145,15 +151,19 @@ class Coordinator:
             max_rounds: 每条用户消息允许的最多协调决策轮数，须为正整数。
             model_tier: 协调者及默认确认判定器使用的模型档位。
             judge: 独立确认判定器；None 时使用协调者的模型调用层构造。
+            data_max_chars: 轮初业务数据区的 JSON 字符上限，最少容纳空列表。
 
         Raises:
             ValueError: max_rounds 不是正整数。
         """
         if type(max_rounds) is not int or max_rounds < 1:
             raise ValueError("协调决策轮数上限必须为正整数")
+        if type(data_max_chars) is not int or data_max_chars < 2:
+            raise ValueError("业务数据字符上限必须为不小于 2 的整数")
         self.gateway, self.runner, self.llm = gateway, runner, llm
         self.max_rounds, self.model_tier = max_rounds, model_tier
         self.judge = judge or ConfirmationJudge(llm, model_tier=model_tier)
+        self.data_max_chars = data_max_chars
 
     async def handle_turn(self, state: ConversationState, user_message: str) -> dict:
         """在内存中处理一条真实用户消息，复用持久运行时的逐轮执行接口。
@@ -201,7 +211,9 @@ class Coordinator:
         state.last_reply = ""
         state.history.append({"role": "user", "content": user_message})
         instance_id = uuid4().hex
+        record_offset = len(self.gateway.records)
         self._reconcile(state, CallContext(state.session, "coordinator", instance_id))
+        self._remember_business(state, self.gateway.records[record_offset:])
         messages = self._messages(state)
         return TurnState(
             user_message,
@@ -210,6 +222,7 @@ class Coordinator:
             messages,
             len(messages),
             previous_reply=previous_reply,
+            business_snapshot=deepcopy(list(state.business_data.values())),
         )
 
     async def advance_turn(
@@ -279,6 +292,7 @@ class Coordinator:
         else:
             work.messages.append(deepcopy(response.message))
             for call in calls:
+                record_offset = len(self.gateway.records)
                 try:
                     arguments = json.loads(call["function"]["arguments"])
                     if not isinstance(arguments, dict):
@@ -292,6 +306,17 @@ class Coordinator:
                         "error": getattr(exc, "code", "invalid_tool_call"),
                         "reason": str(exc),
                     }
+                records = self.gateway.records[record_offset:]
+                self._remember_business(state, records)
+                if call["function"]["name"] in {"complete_plan", "dispatch_tasks"}:
+                    delta = business_updates(
+                        records,
+                        user_id=state.session.user_id,
+                        session_id=state.session.session_id,
+                        turn=state.turn,
+                    )
+                    if delta:
+                        outcome["business_data"] = list(delta.values())
                 work.messages.append(
                     {
                         "role": "tool",
@@ -430,7 +455,9 @@ class Coordinator:
             "reply 只能在所有任务完成、撤销、等待用户或失败后调用。"
             "show_task_ids为要展示待确认详情的任务，省略展示全部，空列表不展示。"
             "协调工具返回变化摘要；当前完整任务清单只看本次请求附带的权威状态。"
-            "其中事实与执行记录只保留关键标识和结果摘要，需要业务明细时重新查询。"
+            "任务区不含事实和动作历史；业务明细优先看本轮工具结果，其次看轮初业务参考数据。"
+            "本轮子Agent查询和核验结果在协调工具返回的business_data中；它们优先于轮初旧数据。"
+            "数据标记已变更或已移出时须重新查询，不能用旧值推断。"
             "reply.message 是原样发送给用户的非空正文；代码只在正文之后附加所选操作的确认卡片。"
             "请用自然语言回答问题、解释、追问和汇总办理结果，不贴JSON、内部标识或任务字段名。"
             "不另造卡片中的办理参数或金额；引用卡片金额解释用户疑问时保持一致。"
@@ -466,7 +493,32 @@ class Coordinator:
             ),
         }
         boundary = work.base_messages - 1
-        return [*work.messages[:boundary], snapshot, *work.messages[boundary:]]
+        data = {
+            "role": "system",
+            "content": DATA_NOTICE
+            + json.dumps(work.business_snapshot, ensure_ascii=False, separators=(",", ":")),
+        }
+        return [*work.messages[:boundary], data, snapshot, *work.messages[boundary:]]
+
+    def _remember_business(self, state: ConversationState, records: list[dict]) -> None:
+        """将本次真实查询并入持久参考缓存，轮初模型视图在本轮保持不变。
+
+        Args:
+            state: 当前会话与参考缓存，身份未验证时不写入业务数据。
+            records: 本次网关新增记录，包含子 Agent、协调者及代码核验调用。
+        """
+        if state.session.user_id is None:
+            return
+        updates = business_updates(
+            records,
+            user_id=state.session.user_id,
+            session_id=state.session.session_id,
+            turn=state.turn,
+        )
+        for key, entry in updates.items():
+            state.business_data.pop(key, None)
+            state.business_data[key] = entry
+        limit_business_data(state.business_data, self.data_max_chars)
 
     @staticmethod
     def _confirmation_view(decisions: list[dict]) -> list[dict]:
@@ -558,6 +610,7 @@ class Coordinator:
         if state.session.user_id is None:
             return
         for task in state.tasks.tasks.values():
+            task.clear_terminal_fields()
             if task.status not in {"pending_confirm", "needs_verification", "failed"}:
                 continue
             task_context = replace(context, task_id=task.id, revision=task.revision)
@@ -681,6 +734,7 @@ class Coordinator:
                 task.reason = str(exc)
                 task.reason_internal = False
                 entry.update(status=task.status, error=exc.code, reason=str(exc))
+            task.clear_terminal_fields()
             results.append(entry)
         return results
 
@@ -701,6 +755,7 @@ class Coordinator:
         task.status = "done" if verification["verified"] else "failed"
         task.reason = None if verification["verified"] else verification["reason"]
         task.reason_internal = False
+        task.clear_terminal_fields()
         return verification
 
     async def _dispatch(
@@ -754,6 +809,7 @@ class Coordinator:
                 if task.status == "running":
                     task.status, task.reason = "failed", f"分派中断：{type(exc).__name__}"
                     task.reason_internal = True
+                    task.clear_terminal_fields()
                     self._interrupted_records(state, task)
             raise
         return {"dispatched": [task_brief(task.to_dict()) for task in selected], "blocked": blocked}
@@ -848,12 +904,14 @@ class Coordinator:
         except (LLMError, TimeoutError, ValueError) as exc:
             task.status, task.reason = "failed", f"子 Agent 调用失败：{type(exc).__name__}"
             task.reason_internal = True
+            task.clear_terminal_fields()
             self._interrupted_records(state, task)
             self._discard_prepared(context, task)
             return
         except (asyncio.CancelledError, OSError) as exc:
             task.status, task.reason = "failed", f"子 Agent 中断：{type(exc).__name__}"
             task.reason_internal = True
+            task.clear_terminal_fields()
             self._interrupted_records(state, task)
             self._discard_prepared(context, task)
             raise
@@ -895,6 +953,7 @@ class Coordinator:
                     )
             task.status, task.reason = "failed", "子 Agent 操作与分派任务不一致"
             task.reason_internal = True
+            task.clear_terminal_fields()
             self._guard("dispatch_result", task.reason)
             return
         task.operation_ids = operation_ids
@@ -923,6 +982,8 @@ class Coordinator:
         for operation in operations:
             if operation["status"] == "committed":
                 self._verify(task, context, operation)
+
+        task.clear_terminal_fields()
 
     def _discard_prepared(self, context: CallContext, task: Task) -> None:
         """清理中断任务的准备项，已提交操作保留为待核验。
@@ -1015,6 +1076,7 @@ class Coordinator:
             if task.status != "done":
                 task.status, task.reason = "failed", reason
                 task.reason_internal = True
+            task.clear_terminal_fields()
 
     def _reply(
         self,

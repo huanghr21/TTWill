@@ -64,6 +64,12 @@ class Task:
         """返回与内部可变字段隔离的完整任务快照。"""
         return asdict(self)
 
+    def clear_terminal_fields(self) -> None:
+        """终态任务清空信息缺口与备注，保留完整请求、事实和操作记录。"""
+        if self.status in {"done", "cancelled", "failed"}:
+            self.missing = []
+            self.note = ""
+
 
 class TaskChange(BaseModel):
     """限定模型只能提出请求增改、撤销原因和信息缺口。"""
@@ -365,7 +371,7 @@ class TaskStore:
         if change.operation == "cancel":
             task.status = "cancelled"
             task.reason = change.reason
-            task.missing = []
+            task.clear_terminal_fields()
             return task.id, True
         for name, value in candidate.items():
             setattr(task, name, value)

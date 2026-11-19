@@ -243,16 +243,71 @@ def test_cancel_releases_order_and_records_reason(runtime: tuple) -> None:
     store.apply([request()], gateway, context)
     task = next(iter(store.tasks.values()))
     operation = prepare(gateway, context, task)
+    task.missing = ["过时的取消原因"]
+    task.note = "请继续补充资料"
+    task.facts.append({"tool": "get_order_details", "result": {"items": [{"item_id": "a"}]}})
+    previous_facts, previous_actions = deepcopy(task.facts), deepcopy(task.actions)
     store.apply(
         [TaskChange(operation="cancel", task_id=task.id, reason="用户改变主意")], gateway, context
     )
     cancelled = store.tasks[task.id]
     assert cancelled.status == "cancelled" and cancelled.reason == "用户改变主意"
     assert cancelled.operation_ids == []
+    assert cancelled.missing == [] and cancelled.note == ""
+    assert cancelled.facts == previous_facts
+    assert cancelled.actions[:-1] == previous_actions
+    assert cancelled.actions[-1]["status"] == "rejected"
     assert gateway.get_operation(context, operation["operation_id"])["status"] == "rejected"
     store.apply([request()], gateway, context)
     fresh = next(item for item in store.tasks.values() if item.id != task.id)
     assert prepare(gateway, context, fresh)["status"] == "prepared"
+
+
+@pytest.mark.parametrize("status", ["done", "cancelled", "failed"])
+def test_terminal_field_cleanup_preserves_full_execution_evidence(status):
+    """终态清理仅删除信息缺口和备注，事实、操作及其他任务字段保持完整。"""
+    task = Task(
+        "t1",
+        "order_service",
+        "cancel_pending_order",
+        "取消一号订单",
+        status=status,
+        missing=["取消原因"],
+        note="请再确认",
+        facts=[{"result": {"items": [{"item_id": "a", "price": 100}]}}],
+        actions=[{"result": {"operation_id": "op1", "status": "committed", "preview": {}}}],
+        operation_ids=["op1"],
+        reason="核验后的状态说明",
+    )
+    before = task.to_dict()
+    assert before["missing"] == ["取消原因"] and before["note"] == "请再确认"
+
+    task.clear_terminal_fields()
+    task.clear_terminal_fields()
+
+    assert task.to_dict() == before | {"missing": [], "note": ""}
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["pending", "conditional", "running", "waiting_info", "pending_confirm", "needs_verification"],
+)
+def test_active_task_cleanup_keeps_missing_information_and_note(status):
+    """尚未终止的任务保留信息缺口与备注，不因共用清理入口丢失办理要求。"""
+    task = Task(
+        "t1",
+        "order_service",
+        "cancel_pending_order",
+        "取消一号订单",
+        status=status,
+        missing=["取消原因"],
+        note="请补充取消原因",
+    )
+    before = task.to_dict()
+
+    task.clear_terminal_fields()
+
+    assert task.to_dict() == before
 
 
 @pytest.mark.parametrize("status", ["done", "cancelled"])

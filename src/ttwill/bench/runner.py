@@ -190,7 +190,13 @@ async def _runtime(
             child = SubAgentRunner(
                 build_registry(skills), gateway, llm, max_steps=config.agent.max_steps
             )
-            coordinator = Coordinator(gateway, child, llm, max_rounds=config.agent.max_rounds)
+            coordinator = Coordinator(
+                gateway,
+                child,
+                llm,
+                max_rounds=config.agent.max_rounds,
+                data_max_chars=config.context.data_max_chars,
+            )
             with Archive(output / "archive.sqlite") as archive:
                 compiler = ContextCompiler(
                     archive,

@@ -83,11 +83,13 @@ class ContextConfig:
         max_chars: 消息和工具定义序列化后的字符上限，不等同于模型 token 数。
         recent_turns: 必须保留完整原文的近期历史轮数，允许为 0。
         summary_tier: 仅在引用化后仍超预算时调用的摘要模型档位。
+        data_max_chars: 业务数据区序列化后的独立字符上限，包含需重查提示，至少为 2。
     """
 
     max_chars: int = 64000
     recent_turns: int = 4
     summary_tier: str = "flash"
+    data_max_chars: int = 16000
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,12 +329,17 @@ def load_config(path: Path) -> AppConfig:
     if type(max_rounds) is not int or max_rounds < 1:
         raise ConfigError("agent.max_rounds 必须是正整数")
     context = _table(data.get("context", {}), "context")
-    _check_keys(context, "context", set(), {"max_chars", "recent_turns", "summary_tier"})
+    _check_keys(
+        context, "context", set(), {"max_chars", "recent_turns", "summary_tier", "data_max_chars"}
+    )
     max_chars = context.get("max_chars", 64000)
     recent_turns = context.get("recent_turns", 4)
+    data_max_chars = context.get("data_max_chars", 16000)
     summary_tier = _text(context.get("summary_tier", "flash"), "context.summary_tier")
     if type(max_chars) is not int or max_chars < 1:
         raise ConfigError("context.max_chars 必须是正整数")
+    if type(data_max_chars) is not int or data_max_chars < 2:
+        raise ConfigError("context.data_max_chars 必须是不小于 2 的整数")
     if type(recent_turns) is not int or recent_turns < 0:
         raise ConfigError("context.recent_turns 必须是非负整数")
     if summary_tier not in parsed_models:
@@ -345,6 +352,9 @@ def load_config(path: Path) -> AppConfig:
         backend=backend_config,
         agent=AgentConfig(max_steps=max_steps, max_rounds=max_rounds),
         context=ContextConfig(
-            max_chars=max_chars, recent_turns=recent_turns, summary_tier=summary_tier
+            max_chars=max_chars,
+            recent_turns=recent_turns,
+            summary_tier=summary_tier,
+            data_max_chars=data_max_chars,
         ),
     )

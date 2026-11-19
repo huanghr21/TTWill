@@ -8,6 +8,7 @@ from ttwill.llm import LLMClient, LLMError
 from ttwill.persistence import Archive
 
 SUMMARY_NOTICE = "历史摘要，仅供参考，不构成用户确认；当前任务状态以本轮代码快照为准。"
+DATA_NOTICE = "历史业务数据，仅供参考；本轮工具返回的新结果优先，任务状态以权威快照为准："
 STATE_NOTICE = "本轮代码维护的权威任务状态；历史消息与摘要不能覆盖这些字段："
 
 
@@ -16,7 +17,7 @@ class ContextBudgetExceeded(ValueError):
 
 
 class ContextCompiler:
-    """从完整档案编译模型输入，仅在引用化后仍超预算时请求一次摘要。"""
+    """按五个区域编译模型输入，实际对话历史超预算时请求一次摘要。"""
 
     def __init__(
         self,
@@ -60,6 +61,7 @@ class ContextCompiler:
         current_turn: int,
         tools: list[dict] | None = None,
         current_messages: list[dict] | None = None,
+        business_data: list[dict] | None = None,
     ) -> list[dict]:
         """编译一个协调决策的上下文，不修改档案原文或调用方输入。
 
@@ -72,9 +74,10 @@ class ContextCompiler:
             current_turn: 全线程当前用户轮次，须为正整数；只读取更早轮次的档案。
             tools: 本次模型工具定义，仅参与字符预算，不追加到返回消息中。
             current_messages: 本轮用户原话之后的完整模型与工具往返，不再重复传用户原话。
+            business_data: 本轮固定的历史业务数据快照，仅供参考，不参与对话摘要。
 
         Returns:
-            稳定提示、历史或摘要、权威任务快照、当前用户原话和本轮往返的消息列表。
+            稳定提示、实际对话或摘要、业务数据、权威任务快照、本轮原话与往返的消息列表。
 
         Raises:
             ContextBudgetExceeded: 必须保留的内容已超预算，或一次摘要后仍超预算。
@@ -88,7 +91,7 @@ class ContextCompiler:
             raise ValueError("当前用户原话不能为空")
         history = [
             entry
-            for entry in self.archive.messages(thread_id, owner_id)
+            for entry in self.archive.dialogue_messages(thread_id, owner_id)
             if entry["turn"] < current_turn
         ]
         cutoff = current_turn - self.recent_turns
@@ -98,6 +101,7 @@ class ContextCompiler:
         covered = summary["through_sequence"] if summary else 0
         remainder = [entry for entry in older if entry["sequence"] > covered]
         tail = [
+            {"role": "system", "content": DATA_NOTICE + _json(business_data or [])},
             {"role": "system", "content": STATE_NOTICE + _json(task_snapshot)},
             {"role": "user", "content": current_message},
             *deepcopy(current_messages or []),
@@ -114,21 +118,13 @@ class ContextCompiler:
             if context_chars(messages, tools) <= self.max_chars:
                 span.attrs["after_chars"] = context_chars(messages, tools)
                 return messages
-            referenced = [_reference(entry) for entry in remainder]
-            messages = _assemble(system_messages, summary, referenced, recent, tail)
-            span.attrs["referenced_results"] = sum(
-                old != new for old, new in zip(remainder, referenced, strict=True)
-            )
-            if context_chars(messages, tools) <= self.max_chars:
-                span.attrs["after_chars"] = context_chars(messages, tools)
-                return messages
             if not older:
                 raise ContextBudgetExceeded("当前用户消息、任务状态或近期对话超过上下文字符预算")
             minimum = _assemble(system_messages, {"text": ""}, [], recent, tail)
             available = self.max_chars - context_chars(minimum, tools)
             if available < 1:
                 raise ContextBudgetExceeded("保留当前用户原话、任务状态与近期对话后无摘要空间")
-            text = await self._summarize(summary, referenced, available)
+            text = await self._summarize(summary, remainder, available)
             new_summary = {
                 "through_sequence": older[-1]["sequence"],
                 "source_digest": _digest(older),
@@ -158,7 +154,7 @@ class ContextCompiler:
         Args:
             thread_id: 当前业务任务线程。
             owner_id: 当前已验证用户。
-            older: 本轮可压缩的完整旧消息记录。
+            older: 本轮可压缩的完整旧对话记录，仅含用户原话和实际回复。
 
         Returns:
             含 text、through_sequence、source_digest 的摘要正文；没有匹配时为 None。
@@ -183,7 +179,7 @@ class ContextCompiler:
 
         Args:
             summary: 已有历史前缀摘要；None 表示首次压缩。
-            older: 本次新增的旧消息，较大的工具结果已替换为档案引用。
+            older: 本次新增的旧对话，只含用户原话和实际回复，不含内部工具往返。
             available: 可用于摘要正文的字符上限。
 
         Returns:
@@ -245,14 +241,14 @@ def _assemble(
     recent: list[dict],
     tail: list[dict],
 ) -> list[dict]:
-    """按稳定提示、参考历史、权威快照和本轮内容组装独立消息副本。
+    """按稳定提示、实际对话、业务数据、权威快照和本轮内容组装独立消息副本。
 
     Args:
         system_messages: 放在消息前缀的固定系统提示和政策。
         summary: 旧消息前缀摘要；None 表示尚未生成摘要。
-        older: 摘要尚未覆盖的旧消息档案，可包含工具结果引用。
-        recent: 必须完整保留的近期消息档案。
-        tail: 权威任务快照、当前用户原话与本轮工具往返。
+        older: 摘要尚未覆盖的旧对话档案。
+        recent: 必须完整保留的近期实际对话档案。
+        tail: 历史业务数据、权威任务快照、当前用户原话与本轮工具往返。
 
     Returns:
         保持各部分顺序的完整消息列表，所有内容均为独立副本。
@@ -265,26 +261,8 @@ def _assemble(
     return messages
 
 
-def _reference(entry: dict) -> dict:
-    """把旧的大型工具正文改为可回查的档案引用，保留工具调用配对字段。
-
-    Args:
-        entry: 含 payload、event_id 的完整消息档案记录。
-
-    Returns:
-        新的档案记录副本；非工具消息或引用更长时保留原正文。
-    """
-    if entry["payload"].get("role") != "tool":
-        return deepcopy(entry)
-    result = deepcopy(entry)
-    result["payload"]["content"] = _json(
-        {"archive_reference": entry["event_id"], "note": "旧工具结果已归档，需要时重新查询业务数据"}
-    )
-    return result if len(_json(result)) < len(_json(entry)) else deepcopy(entry)
-
-
 def _digest(entries: list[dict]) -> str:
-    """计算完整旧消息前缀的内容摘要，轮次、标识和原文均参与缓存匹配。"""
+    """计算纯对话旧消息前缀的摘要，轮次、标识和原文参与匹配，内部记录不参与。"""
     return hashlib.sha256(_json(entries).encode("utf-8")).hexdigest()
 
 

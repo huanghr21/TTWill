@@ -240,7 +240,11 @@ async def run_coordinator_demo(config_path: Path) -> dict:
             FakeModel(_coordinator_demo_responses(state, user["email"], order_id)),
         )
         coordinator = Coordinator(
-            gateway, runner, coordinator_llm, max_rounds=config.agent.max_rounds
+            gateway,
+            runner,
+            coordinator_llm,
+            max_rounds=config.agent.max_rounds,
+            data_max_chars=config.context.data_max_chars,
         )
         with trace.span("session", "协调者两轮假模型演示"):
             first = await coordinator.handle_turn(
@@ -470,7 +474,11 @@ async def run_runtime_demo(config_path: Path) -> dict:
 
             coordinator_llm = LLMClient(config, trace, FakeModel(responses()))
             coordinator = Coordinator(
-                gateway, runner, coordinator_llm, max_rounds=config.agent.max_rounds
+                gateway,
+                runner,
+                coordinator_llm,
+                max_rounds=config.agent.max_rounds,
+                data_max_chars=config.context.data_max_chars,
             )
             with Archive(archive_path) as archive:
                 compiler = ContextCompiler(

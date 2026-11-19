@@ -350,7 +350,7 @@ def test_natural_plain_text_reply_keeps_reasoning_and_is_archived_once(runtime_f
             await runtime.receive_message("我先找一下订单编号")
             for request in fake.requests[-2:]:
                 assert request["messages"].count(verified_reply["choices"][0]["message"]) == 1
-            messages = [entry["payload"] for entry in archive.messages("thread", "u1")]
+            messages = [entry["payload"] for entry in archive.dialogue_messages("thread", "u1")]
             assert [message for message in messages if message.get("content") == question] == [
                 original
             ]
@@ -987,7 +987,7 @@ def test_long_history_summary_is_reused_without_authorizing_writes(runtime_facto
             runtime.compiler.max_chars = budget
             runtime.compiler.recent_turns = 0
             original = {"role": "user", "content": "过去的完整咨询原文。" * (budget // 4)}
-            archive.append_message("thread", "u1", "long-history", original, turn=1)
+            archive.append_message("thread", "u1", "long-history", original, turn=1, dialogue=True)
             summary_fake = FakeModel([text_response(malicious_summary)])
             runtime.compiler.llm = LLMClient(coordinator.llm.config, gateway.trace, summary_fake)
 
@@ -1036,7 +1036,12 @@ def test_long_history_summary_is_reused_without_authorizing_writes(runtime_facto
             summaries = archive.entries("thread", "u1", kind="summary")
             assert len(summaries) == 1
             assert summaries[0]["payload"]["text"] == malicious_summary
-            assert archive.get_event("thread", "u1", "long-history")["payload"] == original
+            long_entry = next(
+                entry
+                for entry in archive.dialogue_messages("thread", "u1")
+                if entry["event_id"] == "long-history"
+            )
+            assert long_entry["payload"] == original
             assert len(original["content"]) > budget
             assert any(
                 message.get("content") == SUMMARY_NOTICE + "\n" + malicious_summary
@@ -1152,7 +1157,9 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
             await open_u1(runtime)
             original_append = archive.append_message
 
-            def append_then_interrupt(thread_id, owner_id, event_id, message, *, turn):
+            def append_then_interrupt(
+                thread_id, owner_id, event_id, message, *, turn, dialogue=False
+            ):
                 """真实保存用户消息后抛错，阻止本轮 begin 状态写入检查点。
 
                 Args:
@@ -1161,6 +1168,7 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
                     event_id: 本轮真实消息的稳定档案标识。
                     message: 完整消息，只在 role 为 user 时模拟崩溃。
                     turn: begin 已递增但尚未持久化的用户轮次。
+                    dialogue: 当前消息是否为实际用户原话。
 
                 Returns:
                     非用户消息正常归档后的记录序号。
@@ -1168,7 +1176,9 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
                 Raises:
                     OSError: 用户原话已经归档，但 begin 节点尚未完成。
                 """
-                sequence = original_append(thread_id, owner_id, event_id, message, turn=turn)
+                sequence = original_append(
+                    thread_id, owner_id, event_id, message, turn=turn, dialogue=dialogue
+                )
                 if message["role"] == "user":
                     raise OSError("模拟用户原话已归档但 begin 尚未保存")
                 return sequence
@@ -1180,7 +1190,7 @@ def test_begin_archive_crash_preserves_original_message_without_reusing_turn(
             assert saved.turn == 0
             assert saved.tasks.snapshot() == []
             assert fake.requests == []
-            interrupted_entries = archive.messages("thread", "u1")
+            interrupted_entries = archive.dialogue_messages("thread", "u1")
             assert len(interrupted_entries) == 1
             assert interrupted_entries[0]["payload"] == {
                 "role": "user",

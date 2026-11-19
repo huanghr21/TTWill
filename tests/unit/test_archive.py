@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from ttwill.persistence import Archive
+from ttwill.persistence.archive import DIALOGUE_MARKER
 
 
 def test_messages_survive_reopen_without_truncation(tmp_path):
@@ -173,4 +174,85 @@ def test_invalid_message_rolls_back_entire_batch(tmp_path):
         messages = [tool_exchange()[0], ("invalid", {"role": "unknown", "content": "无效"})]
         with pytest.raises(ValueError, match="有效角色"):
             archive.append_messages("t", "u", messages, turn=1)
+        assert archive.messages("t", "u") == []
+
+
+def test_dialogue_marks_actual_utterances_without_changing_complete_archive(tmp_path):
+    """显式标记跨轮对话，原始工具与内部消息仍完整保存，读取对话不泄漏元数据。"""
+    path = tmp_path / "archive.sqlite"
+    user = {"role": "user", "content": "帮我修改地址"}
+    reply = {"role": "assistant", "content": "请确认以下地址卡片。"}
+    messages = [
+        ("user", user),
+        *tool_exchange(),
+        ("internal", {"role": "assistant", "content": "请确认以下地址卡片。"}),
+        ("unmarked-user", {"role": "user", "content": "帮我修改地址"}),
+        ("reply", reply),
+    ]
+    with Archive(path) as archive:
+        archive.append_messages("t", "u", messages, turn=1, dialogue_ids={"user", "reply"})
+        archive.append_message("other", "u", "user", user, turn=1, dialogue=True)
+        archive.append_message("t", "other", "reply", reply, turn=1, dialogue=True)
+        assert DIALOGUE_MARKER not in user
+        assert DIALOGUE_MARKER not in reply
+    with Archive(path) as archive:
+        dialogue = archive.dialogue_messages("t", "u")
+        assert [entry["event_id"] for entry in dialogue] == ["user", "reply"]
+        assert [entry["payload"] for entry in dialogue] == [user, reply]
+        assert len(archive.messages("t", "u")) == len(messages)
+        assert archive.get_event("t", "u", "result")["payload"] == tool_exchange()[1][1]
+        assert archive.get_event("t", "u", "user")["payload"][DIALOGUE_MARKER] is True
+        dialogue[0]["payload"]["content"] = "外部改动"
+        assert archive.dialogue_messages("t", "u")[0]["payload"] == user
+
+
+def test_dialogue_metadata_is_part_of_idempotency_identity(tmp_path):
+    """重放保留原标记，但不能把已存的内部消息重新定义为实际回复。"""
+    message = {"role": "assistant", "content": "回复正文"}
+    with Archive(tmp_path / "archive.sqlite") as archive:
+        sequence = archive.append_message("t", "u", "reply", message, turn=1, dialogue=True)
+        assert archive.append_message("t", "u", "reply", message, turn=1, dialogue=True) == sequence
+        with pytest.raises(ValueError, match="不同内容"):
+            archive.append_message("t", "u", "reply", message, turn=1)
+        archive.append_message("t", "u", "internal", message, turn=1)
+        with pytest.raises(ValueError, match="不同内容"):
+            archive.append_message("t", "u", "internal", message, turn=1, dialogue=True)
+        assert [entry["event_id"] for entry in archive.dialogue_messages("t", "u")] == ["reply"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "system", "content": "系统内容"},
+        tool_exchange()[0][1],
+        tool_exchange()[1][1],
+    ],
+)
+def test_internal_messages_cannot_be_marked_as_dialogue(tmp_path, message):
+    """误标工具调用、结果或系统内容时整批回滚，不能污染跨轮历史。"""
+    with Archive(tmp_path / "archive.sqlite") as archive:
+        with pytest.raises(ValueError, match="对话标记只接受"):
+            archive.append_messages(
+                "t",
+                "u",
+                [("user", {"role": "user", "content": "原话"}), ("internal", message)],
+                turn=1,
+                dialogue_ids={"user", "internal"},
+            )
+        assert archive.messages("t", "u") == []
+
+
+def test_dialogue_marks_require_explicit_batch_ids(tmp_path):
+    """保留标记不能从原始消息注入，批次外标识也不能被默默忽略。"""
+    with Archive(tmp_path / "archive.sqlite") as archive:
+        with pytest.raises(ValueError, match="本批消息"):
+            archive.append_messages("t", "u", tool_exchange(), turn=1, dialogue_ids={"missing"})
+        with pytest.raises(ValueError, match="档案接口设置"):
+            archive.append_message(
+                "t",
+                "u",
+                "injected",
+                {"role": "user", "content": "原话", DIALOGUE_MARKER: True},
+                turn=1,
+            )
         assert archive.messages("t", "u") == []

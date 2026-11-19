@@ -58,11 +58,14 @@ def reconcile_restored_tasks(
 
         state.last_display = []
         state.last_reply = ""
+        state.business_data.clear()
         for task in state.tasks.tasks.values():
             if not task.is_write and task.status == "running":
                 task.status = "conditional" if task.condition else "pending"
         for task, task_context, operation in recovered:
             _restore_task(task, gateway, task_context, operation)
+        for task in state.tasks.tasks.values():
+            task.clear_terminal_fields()
         span.attrs.update(before=before, after=state.tasks.snapshot())
 
 

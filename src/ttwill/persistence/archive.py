@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any
 
 KINDS = frozenset({"message", "tool_result", "event", "summary"})
+DIALOGUE_MARKER = "_ttwill_dialogue"
 
 
 class Archive:
@@ -141,7 +142,14 @@ class Archive:
         return row["sequence"]
 
     def append_message(
-        self, thread_id: str, owner_id: str, event_id: str, message: dict, *, turn: int
+        self,
+        thread_id: str,
+        owner_id: str,
+        event_id: str,
+        message: dict,
+        *,
+        turn: int,
+        dialogue: bool = False,
     ) -> int:
         """完整保存一条模型格式的消息，不截断正文或工具调用。
 
@@ -151,6 +159,7 @@ class Archive:
             event_id: 该消息在当前作用域内的稳定标识。
             message: 含 role 的 Chat Completions 消息字典。
             turn: 全线程的用户轮次。
+            dialogue: 是否为用户实际原话或实际发出的助手回复，供跨轮对话读取。
 
         Returns:
             本消息对应的档案序号。
@@ -158,7 +167,13 @@ class Archive:
         Raises:
             ValueError: 消息角色无效或同事件标识的内容不同。
         """
-        return self.append_messages(thread_id, owner_id, [(event_id, message)], turn=turn)[0]
+        return self.append_messages(
+            thread_id,
+            owner_id,
+            [(event_id, message)],
+            turn=turn,
+            dialogue_ids={event_id} if dialogue else None,
+        )[0]
 
     def append_messages(
         self,
@@ -167,6 +182,7 @@ class Archive:
         messages: list[tuple[str, dict]],
         *,
         turn: int,
+        dialogue_ids: set[str] | None = None,
     ) -> list[int]:
         """在同一事务内追加整批消息，工具调用及其结果一起保存或一起回滚。
 
@@ -176,6 +192,7 @@ class Archive:
             messages: 按原始顺序排列的事件标识与完整消息二元组列表。
                 每条消息须包含有效 role，相同标识只允许完全相同的内容。
             turn: 全批消息所属的用户轮次。
+            dialogue_ids: 本批中实际用户原话与助手回复的事件标识；默认不标记任何消息。
 
         Returns:
             与输入顺序对应的档案序号；空批次返回空列表。
@@ -188,6 +205,9 @@ class Archive:
         _scope(thread_id, owner_id)
         if type(turn) is not int or turn < 0:
             raise ValueError("档案轮次必须为非负整数")
+        dialogue_ids = dialogue_ids or set()
+        if dialogue_ids - {event_id for event_id, _ in messages}:
+            raise ValueError("对话标记只能指定本批消息的事件标识")
         sequences = []
         with self._lock, self._connection:
             for event_id, message in messages:
@@ -195,8 +215,15 @@ class Archive:
                     raise TypeError("档案消息必须是字典")
                 if message.get("role") not in {"user", "assistant", "tool", "system"}:
                     raise ValueError("档案消息须包含有效角色")
+                if DIALOGUE_MARKER in message:
+                    raise ValueError("对话标记由档案接口设置，不能写入原始消息")
+                payload = message
+                if event_id in dialogue_ids:
+                    if message["role"] not in {"user", "assistant"} or message.get("tool_calls"):
+                        raise ValueError("对话标记只接受用户原话与无工具调用的助手回复")
+                    payload = {**message, DIALOGUE_MARKER: True}
                 sequences.append(
-                    self._append_record(thread_id, owner_id, event_id, "message", message, turn)
+                    self._append_record(thread_id, owner_id, event_id, "message", payload, turn)
                 )
         return sequences
 
@@ -242,6 +269,28 @@ class Archive:
             按追加顺序排列的 message 记录，正文位于各项的 payload。
         """
         return self.entries(thread_id, owner_id, kind="message")
+
+    def dialogue_messages(self, thread_id: str, owner_id: str) -> list[dict]:
+        """读取显式标记的实际对话，去掉内部元数据，不根据角色或正文猜测用途。
+
+        Args:
+            thread_id: 要读取的业务任务线程标识。
+            owner_id: 要读取的已验证业务用户标识。
+
+        Returns:
+            按追加顺序排列的用户原话与实际回复记录；payload 不含内部对话标记。
+            未标记的历史消息不会进入结果，完整档案不受影响。
+        """
+        dialogue = []
+        for entry in self.messages(thread_id, owner_id):
+            payload = entry["payload"]
+            if payload.get(DIALOGUE_MARKER) is True and payload.get("role") in {
+                "user",
+                "assistant",
+            }:
+                del payload[DIALOGUE_MARKER]
+                dialogue.append(entry)
+        return dialogue
 
     def get_event(self, thread_id: str, owner_id: str, event_id: str) -> dict | None:
         """按引用读取完整消息、工具结果或其他事件。
